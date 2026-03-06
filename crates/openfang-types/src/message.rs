@@ -60,6 +60,10 @@ pub enum ContentBlock {
         name: String,
         /// The tool input parameters.
         input: serde_json::Value,
+        /// Optional thought signature required by Gemini 2.5+ models for multi-turn
+        /// function calls. Must be echoed back verbatim in the next request turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     /// A tool result from executing a tool.
     #[serde(rename = "tool_result")]
