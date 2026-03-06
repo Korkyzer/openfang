@@ -2147,34 +2147,64 @@ impl OpenFangKernel {
                 );
                 manifest.model.model = pinned.clone();
             }
-        } else if let Some(ref routing_config) = manifest.routing {
-            let mut router = ModelRouter::new(routing_config.clone());
-            // Resolve aliases (e.g. "sonnet" -> "claude-sonnet-4-20250514") before scoring
-            router.resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
-            // Build a probe request to score complexity
-            let probe = CompletionRequest {
-                model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
-                messages: vec![openfang_types::message::Message::user(message)],
-                tools: tools.clone(),
-                max_tokens: manifest.model.max_tokens,
-                temperature: manifest.model.temperature,
-                system: Some(manifest.model.system_prompt.clone()),
-                thinking: None,
-            };
-            let (complexity, routed_model) = router.select_model(&probe);
-            info!(
-                agent = %manifest.name,
-                complexity = %complexity,
-                routed_model = %routed_model,
-                "Model routing applied"
-            );
-            manifest.model.model = routed_model.clone();
-            // Also update provider if the routed model belongs to a different provider
-            if let Ok(cat) = self.model_catalog.read() {
-                if let Some(entry) = cat.find_model(&routed_model) {
-                    if entry.provider != manifest.model.provider {
-                        info!(old = %manifest.model.provider, new = %entry.provider, "Model routing changed provider");
-                        manifest.model.provider = entry.provider.clone();
+        } else {
+            // Step 1: Try external meta-router (if configured)
+            let mut routed_externally = false;
+            if let Some(ref meta_url) = self.config.meta_router_url {
+                let channel = manifest.metadata
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&manifest.name);
+
+                if let Some(route) = openfang_runtime::meta_router::query_meta_router(
+                    meta_url, message, channel
+                ).await {
+                    info!(
+                        agent = %manifest.name,
+                        provider = %route.provider,
+                        model = %route.model,
+                        complexity = %route.complexity,
+                        reason = %route.reason,
+                        "Meta-router selected model"
+                    );
+                    manifest.model.model = route.model;
+                    manifest.model.provider = route.provider;
+                    if !route.base_url.is_empty() {
+                        manifest.model.base_url = Some(route.base_url);
+                    }
+                    routed_externally = true;
+                }
+            }
+
+            // Step 2: Fallback to local ModelRouter heuristics
+            if !routed_externally {
+                if let Some(ref routing_config) = manifest.routing {
+                    let mut router = ModelRouter::new(routing_config.clone());
+                    router.resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
+                    let probe = CompletionRequest {
+                        model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
+                        messages: vec![openfang_types::message::Message::user(message)],
+                        tools: tools.clone(),
+                        max_tokens: manifest.model.max_tokens,
+                        temperature: manifest.model.temperature,
+                        system: Some(manifest.model.system_prompt.clone()),
+                        thinking: None,
+                    };
+                    let (complexity, routed_model) = router.select_model(&probe);
+                    info!(
+                        agent = %manifest.name,
+                        complexity = %complexity,
+                        routed_model = %routed_model,
+                        "Model routing applied (local fallback)"
+                    );
+                    manifest.model.model = routed_model.clone();
+                    if let Ok(cat) = self.model_catalog.read() {
+                        if let Some(entry) = cat.find_model(&routed_model) {
+                            if entry.provider != manifest.model.provider {
+                                info!(old = %manifest.model.provider, new = %entry.provider, "Model routing changed provider");
+                                manifest.model.provider = entry.provider.clone();
+                            }
+                        }
                     }
                 }
             }
