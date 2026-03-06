@@ -10,7 +10,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Default timeout for the meta-router HTTP call.
-const META_ROUTER_TIMEOUT: Duration = Duration::from_secs(3);
+const META_ROUTER_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Request payload sent to the meta-router `/v1/route` endpoint.
 #[derive(Debug, Serialize)]
