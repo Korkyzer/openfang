@@ -19,6 +19,10 @@ decay_rate = 0.05                         # Memory confidence decay rate
 listen_addr = "127.0.0.1:4200"           # OFP listen address
 # shared_secret = ""                      # Required for P2P authentication
 
+# External meta-router URL for intelligent model routing.
+# When set, the kernel queries this service before falling back to local heuristics.
+# meta_router_url = "http://localhost:5002"
+
 # Session compaction (LLM-based context management)
 # [compaction]
 # threshold = 80                          # Compact when messages exceed this count
