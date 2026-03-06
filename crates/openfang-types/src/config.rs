@@ -1062,6 +1062,11 @@ pub struct KernelConfig {
     /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
     #[serde(default)]
     pub provider_urls: HashMap<String, String>,
+    /// URL of the external meta-router dispatcher (e.g. "http://localhost:5002").
+    /// When set, the kernel queries this service for model routing decisions before
+    /// falling back to local ModelRouter heuristics.
+    #[serde(default)]
+    pub meta_router_url: Option<String>,
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
@@ -1235,6 +1240,7 @@ impl Default for KernelConfig {
             thinking: None,
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
+            meta_router_url: None,
             oauth: OAuthConfig::default(),
         }
     }
