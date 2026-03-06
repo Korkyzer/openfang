@@ -74,6 +74,10 @@ enum GeminiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCallData,
+        /// Thought signature from Gemini 2.5+ thinking models.
+        /// Must be round-tripped verbatim in the next request turn.
+        #[serde(rename = "thoughtSignature", default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
@@ -197,12 +201,13 @@ fn convert_messages(
                         ContentBlock::Text { text } => {
                             parts.push(GeminiPart::Text { text: text.clone() });
                         }
-                        ContentBlock::ToolUse { name, input, .. } => {
+                        ContentBlock::ToolUse { name, input, thought_signature, .. } => {
                             parts.push(GeminiPart::FunctionCall {
                                 function_call: GeminiFunctionCallData {
                                     name: name.clone(),
                                     args: input.clone(),
                                 },
+                                thought_signature: thought_signature.clone(),
                             });
                         }
                         ContentBlock::Image { media_type, data } => {
@@ -314,12 +319,13 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
                             content.push(ContentBlock::Text { text });
                         }
                     }
-                    GeminiPart::FunctionCall { function_call } => {
+                    GeminiPart::FunctionCall { function_call, thought_signature } => {
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
                         content.push(ContentBlock::ToolUse {
                             id: id.clone(),
                             name: function_call.name.clone(),
                             input: function_call.args.clone(),
+                            thought_signature,
                         });
                         tool_calls.push(ToolCall {
                             id,
@@ -397,7 +403,6 @@ impl LlmDriver for GeminiDriver {
                 self.base_url, request.model
             );
             debug!(url = %url, attempt, "Sending Gemini API request");
-
             let resp = self
                 .client
                 .post(&url)
@@ -523,7 +528,7 @@ impl LlmDriver for GeminiDriver {
             let mut buffer = String::new();
             let mut text_content = String::new();
             // Track function calls: (name, args_json)
-            let mut fn_calls: Vec<(String, serde_json::Value)> = Vec::new();
+            let mut fn_calls: Vec<(String, serde_json::Value, Option<String>)> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut usage = TokenUsage::default();
 
@@ -574,7 +579,7 @@ impl LlmDriver for GeminiDriver {
                                                 .await;
                                         }
                                     }
-                                    GeminiPart::FunctionCall { function_call } => {
+                                    GeminiPart::FunctionCall { function_call, thought_signature } => {
                                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
                                         let _ = tx
                                             .send(StreamEvent::ToolUseStart {
@@ -597,6 +602,7 @@ impl LlmDriver for GeminiDriver {
                                         fn_calls.push((
                                             function_call.name.clone(),
                                             function_call.args.clone(),
+                                            thought_signature.clone(),
                                         ));
                                     }
                                     GeminiPart::InlineData { .. }
@@ -616,12 +622,13 @@ impl LlmDriver for GeminiDriver {
                 content.push(ContentBlock::Text { text: text_content });
             }
 
-            for (name, args) in fn_calls {
+            for (name, args, thought_signature) in fn_calls {
                 let id = format!("call_{}", uuid::Uuid::new_v4().simple());
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: args.clone(),
+                    thought_signature,
                 });
                 tool_calls.push(ToolCall {
                     id,

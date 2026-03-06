@@ -351,6 +351,7 @@ pub async fn run_agent_loop(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        thought_signature: None,
                     });
                 }
                 response.content = new_blocks;
@@ -1267,6 +1268,7 @@ pub async fn run_agent_loop_streaming(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        thought_signature: None,
                     });
                 }
                 response.content = new_blocks;
