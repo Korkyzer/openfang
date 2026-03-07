@@ -567,8 +567,34 @@ impl OpenFangKernel {
                 warn!(
                     provider = %config.default_model.provider,
                     error = %e,
-                    "Primary LLM driver init failed — dashboard will still be accessible"
+                    "Primary LLM driver init failed — trying auto-detect"
                 );
+                // Auto-detect: scan env for any configured provider key
+                if let Some((provider, model, env_var)) = drivers::detect_available_provider() {
+                    let auto_config = DriverConfig {
+                        provider: provider.to_string(),
+                        api_key: std::env::var(env_var).ok(),
+                        base_url: config.provider_urls.get(provider).cloned(),
+                    };
+                    match drivers::create_driver(&auto_config) {
+                        Ok(d) => {
+                            info!(
+                                provider = %provider,
+                                model = %model,
+                                "Auto-detected provider from {} — using as default",
+                                env_var
+                            );
+                            driver_chain.push(d);
+                            // Update the running config so agents get the right model
+                            config.default_model.provider = provider.to_string();
+                            config.default_model.model = model.to_string();
+                            config.default_model.api_key_env = env_var.to_string();
+                        }
+                        Err(e2) => {
+                            warn!(provider = %provider, error = %e2, "Auto-detected provider also failed");
+                        }
+                    }
+                }
             }
         }
 
