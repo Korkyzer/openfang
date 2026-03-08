@@ -96,6 +96,9 @@ struct GeminiInlineData {
 struct GeminiFunctionCallData {
     name: String,
     args: serde_json::Value,
+    /// Gemini 2.5+ thinking models return this on functionCall parts.
+    #[serde(rename = "thoughtSignature", default, skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -206,6 +209,7 @@ fn convert_messages(
                                 function_call: GeminiFunctionCallData {
                                     name: name.clone(),
                                     args: input.clone(),
+                                    thought_signature: None,
                                 },
                                 thought_signature: thought_signature.clone(),
                             });
