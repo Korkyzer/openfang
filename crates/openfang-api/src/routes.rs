@@ -446,7 +446,7 @@ pub async fn get_agent_session(
                                 openfang_types::message::ContentBlock::ToolUse {
                                     id,
                                     name,
-                                    input,
+                                    input, ..
                                 } => {
                                     let tool_idx = tools.len();
                                     tools.push(serde_json::json!({
