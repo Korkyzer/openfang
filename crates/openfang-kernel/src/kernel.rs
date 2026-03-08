@@ -2148,7 +2148,10 @@ impl OpenFangKernel {
                 manifest.model.model = pinned.clone();
             }
         } else {
-            // Step 1: Try external meta-router (if configured)
+            // Step 1: Route through meta-router proxy (if configured)
+            // Instead of querying /v1/route for advice and calling providers directly,
+            // we route ALL LLM calls through the meta-router's /v1/chat/completions
+            // endpoint. The meta-router handles model selection AND execution.
             let mut routed_externally = false;
             if let Some(ref meta_url) = self.config.meta_router_url {
                 let channel = manifest.metadata
@@ -2156,24 +2159,26 @@ impl OpenFangKernel {
                     .and_then(|v| v.as_str())
                     .unwrap_or(&manifest.name);
 
-                if let Some(route) = openfang_runtime::meta_router::query_meta_router(
-                    meta_url, message, channel
-                ).await {
-                    info!(
-                        agent = %manifest.name,
-                        provider = %route.provider,
-                        model = %route.model,
-                        complexity = %route.complexity,
-                        reason = %route.reason,
-                        "Meta-router selected model"
-                    );
-                    manifest.model.model = route.model;
-                    manifest.model.provider = route.provider;
-                    if !route.base_url.is_empty() {
-                        manifest.model.base_url = Some(route.base_url);
-                    }
-                    routed_externally = true;
-                }
+                let meta_base = format!("{}/v1", meta_url.trim_end_matches('/'));
+                let original_model = manifest.model.model.clone();
+                let original_provider = manifest.model.provider.clone();
+
+                // Encode channel as model prefix: "asa/claude-sonnet-4-6"
+                // The meta-router extracts the channel from this prefix.
+                manifest.model.model = format!("{}/{}", channel, original_model);
+                manifest.model.base_url = Some(meta_base);
+                // Force OpenAI-compatible driver — meta-router speaks OpenAI protocol
+                manifest.model.provider = "openai".to_string();
+
+                info!(
+                    agent = %manifest.name,
+                    channel = %channel,
+                    original_model = %original_model,
+                    original_provider = %original_provider,
+                    meta_router = %meta_url,
+                    "Routing LLM calls through meta-router proxy"
+                );
+                routed_externally = true;
             }
 
             // Step 2: Fallback to local ModelRouter heuristics
