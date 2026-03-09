@@ -150,7 +150,7 @@ pub fn contains_shell_metacharacters(command: &str) -> Option<String> {
 
 /// Extract the base command name from a command string.
 /// Handles paths (e.g., "/usr/bin/python3" → "python3").
-fn extract_base_command(cmd: &str) -> &str {
+pub fn extract_base_command(cmd: &str) -> &str {
     let trimmed = cmd.trim();
     // Take first word (space-delimited)
     let first_word = trimmed.split_whitespace().next().unwrap_or("");
