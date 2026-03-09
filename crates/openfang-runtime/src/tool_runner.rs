@@ -245,20 +245,10 @@ pub async fn execute_tool(
                     };
                 }
             }
-            // Skip heuristic taint patterns when exec policy explicitly allows
-            // the command (Full mode or base command in the allowlist).
-            let skip_taint_heuristic = exec_policy.is_some_and(|p| {
-                match p.mode {
-                    openfang_types::config::ExecSecurityMode::Full => true,
-                    openfang_types::config::ExecSecurityMode::Allowlist => {
-                        let base = crate::subprocess_sandbox::extract_base_command(command);
-                        p.safe_bins.iter().any(|sb| sb == base)
-                            || p.allowed_commands.iter().any(|ac| ac == base)
-                    }
-                    _ => false,
-                }
-            });
-            if !skip_taint_heuristic {
+            // Skip heuristic taint patterns for Full exec policy (e.g. hand agents that need curl)
+            let is_full_exec = exec_policy
+                .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full);
+            if !is_full_exec {
                 if let Some(violation) = check_taint_shell_exec(command) {
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),

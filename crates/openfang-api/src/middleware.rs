@@ -87,6 +87,7 @@ pub async fn auth(
         || (path == "/api/agents" && is_get)
         || (path == "/api/profiles" && is_get)
         || (path == "/api/config" && is_get)
+        || (path == "/api/config/schema" && is_get)
         || (path.starts_with("/api/uploads/") && is_get)
         // Dashboard read endpoints — allow unauthenticated so the SPA can
         // render before the user enters their API key.
@@ -118,17 +119,11 @@ pub async fn auth(
         return next.run(request).await;
     }
 
-    // SECURITY: If no API key configured, non-public endpoints still require auth.
-    // Fall through to the token check which will fail (no valid token matches empty key),
-    // returning 401 for any non-whitelisted route.
+    // If no API key configured, skip auth entirely.
+    // Users who don't set api_key accept that all endpoints are open.
+    // To secure the dashboard, set api_key in config.toml.
     if api_key.is_empty() {
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("www-authenticate", "Bearer")
-            .body(Body::from(
-                serde_json::json!({"error": "No API key configured. Set api_key in config.toml or pass --api-key on startup."}).to_string(),
-            ))
-            .unwrap_or_default();
+        return next.run(request).await;
     }
 
     // Check Authorization: Bearer <token> header, then fallback to X-API-Key
@@ -202,7 +197,7 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     // All JS/CSS is bundled inline — only external resource is Google Fonts.
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
             .parse()
             .unwrap(),
     );
