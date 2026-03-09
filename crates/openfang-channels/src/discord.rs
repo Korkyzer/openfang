@@ -20,6 +20,8 @@ const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DISCORD_MSG_LIMIT: usize = 2000;
+/// Discord message flag for voice messages (1 << 13).
+const VOICE_MESSAGE_FLAG: u64 = 1 << 13;
 
 /// Discord Gateway opcodes.
 mod opcode {
@@ -122,106 +124,15 @@ impl DiscordAdapter {
         Ok(())
     }
 
-    /// Send a message and return the message ID.
-    async fn api_send_message_with_id(
-        &self,
-        channel_id: &str,
-        text: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-        let body = serde_json::json!({ "content": text });
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bot {}", self.token.as_str()))
-            .json(&body)
-            .send()
-            .await?;
-        let data: serde_json::Value = resp.json().await?;
-        let msg_id = data["id"].as_str().unwrap_or("").to_string();
-        Ok(msg_id)
-    }
-
-    /// Edit an existing message by ID.
-    async fn api_edit_message(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
-        let chunks = split_message(text, DISCORD_MSG_LIMIT);
-
-        // Edit original with first chunk
-        if let Some(first) = chunks.first() {
-            let body = serde_json::json!({ "content": first });
-            let resp = self
-                .client
-                .patch(&url)
-                .header("Authorization", format!("Bot {}", self.token.as_str()))
-                .json(&body)
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                warn!("Discord editMessage failed: {body_text}");
-            }
-        }
-
-        // Send remaining chunks as new messages
-        if chunks.len() > 1 {
-            let send_url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-            for chunk in chunks.iter().skip(1) {
-                let body = serde_json::json!({ "content": chunk });
-                let _ = self
-                    .client
-                    .post(&send_url)
-                    .header("Authorization", format!("Bot {}", self.token.as_str()))
-                    .json(&body)
-                    .send()
-                    .await;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Delete a message by ID.
-    async fn api_delete_message(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
-        let resp = self
-            .client
-            .delete(&url)
-            .header("Authorization", format!("Bot {}", self.token.as_str()))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            warn!("Discord deleteMessage failed: {body_text}");
-        }
-        Ok(())
-    }
-
-        /// Send typing indicator to a Discord channel.
+    /// Send typing indicator to a Discord channel.
     async fn api_send_typing(&self, channel_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/typing");
-        let resp = self
+        let _ = self
             .client
             .post(&url)
             .header("Authorization", format!("Bot {}", self.token.as_str()))
             .send()
             .await?;
-        let status = resp.status();
-        if status.is_success() {
-            info!("Discord typing sent to channel {channel_id} (status={status})");
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            warn!("Discord typing FAILED for channel {channel_id}: status={status} body={body}");
-        }
         Ok(())
     }
 }
@@ -246,6 +157,7 @@ impl ChannelAdapter for DiscordAdapter {
         let (tx, rx) = mpsc::channel::<ChannelMessage>(256);
 
         let token = self.token.clone();
+        let http_client = self.client.clone();
         let intents = self.intents;
         let allowed_guilds = self.allowed_guilds.clone();
         let allowed_users = self.allowed_users.clone();
@@ -439,7 +351,7 @@ impl ChannelAdapter for DiscordAdapter {
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
                                     if let Some(msg) =
-                                        parse_discord_message(d, &bot_user_id, &allowed_guilds, &allowed_users, ignore_bots)
+                                        parse_discord_message(d, &bot_user_id, &allowed_guilds, &allowed_users, ignore_bots, &http_client, token.as_str())
                                             .await
                                     {
                                         debug!(
@@ -544,41 +456,6 @@ impl ChannelAdapter for DiscordAdapter {
         self.api_send_typing(&user.platform_id).await
     }
 
-    async fn send_placeholder(
-        &self,
-        user: &ChannelUser,
-        text: &str,
-        _thread_id: Option<&str>,
-    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let msg_id = self.api_send_message_with_id(&user.platform_id, text).await?;
-        if msg_id.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(msg_id))
-        }
-    }
-
-    async fn delete_message(
-        &self,
-        user: &ChannelUser,
-        message_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.api_delete_message(&user.platform_id, message_id).await
-    }
-
-        async fn edit_message(
-        &self,
-        user: &ChannelUser,
-        message_id: &str,
-        content: ChannelContent,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let text = match content {
-            ChannelContent::Text(ref t) => t.as_str(),
-            _ => "(Unsupported content type)",
-        };
-        self.api_edit_message(&user.platform_id, message_id, text).await
-    }
-
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
         Ok(())
@@ -592,6 +469,8 @@ async fn parse_discord_message(
     allowed_guilds: &[String],
     allowed_users: &[String],
     ignore_bots: bool,
+    http_client: &reqwest::Client,
+    bot_token: &str,
 ) -> Option<ChannelMessage> {
     let author = d.get("author")?;
     let author_id = author["id"].as_str()?;
@@ -624,7 +503,55 @@ async fn parse_discord_message(
     }
 
     let content_text = d["content"].as_str().unwrap_or("");
-    if content_text.is_empty() {
+
+    // Detect voice message attachments before bailing on empty content.
+    // Discord voice messages have the IS_VOICE_MESSAGE flag (1 << 13) and/or
+    // an attachment with content_type starting with "audio/".
+    let voice_transcription = if content_text.is_empty() {
+        let has_voice_flag = d["flags"]
+            .as_u64()
+            .map_or(false, |f| f & VOICE_MESSAGE_FLAG != 0);
+        let audio_attachment = d["attachments"].as_array().and_then(|attachments| {
+            attachments.iter().find(|a| {
+                a["content_type"]
+                    .as_str()
+                    .map_or(false, |ct| ct.starts_with("audio/"))
+            })
+        });
+
+        if has_voice_flag || audio_attachment.is_some() {
+            // Pick the audio attachment (or first attachment as fallback)
+            let attachment = audio_attachment.or_else(|| {
+                d["attachments"]
+                    .as_array()
+                    .and_then(|a| a.first())
+            });
+            if let Some(url) = attachment.and_then(|a| a["url"].as_str()) {
+                match transcribe_voice(http_client, url, bot_token).await {
+                    Ok(text) => {
+                        info!("Discord voice message transcribed ({} chars)", text.len());
+                        Some(format!("[Voice message transcribed]: {text}"))
+                    }
+                    Err(e) => {
+                        warn!("Discord voice transcription failed: {e}");
+                        Some("[Voice message - transcription failed]".to_string())
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let effective_content = voice_transcription
+        .as_deref()
+        .unwrap_or(content_text);
+
+    if effective_content.is_empty() {
         return None;
     }
 
@@ -645,8 +572,8 @@ async fn parse_discord_message(
         .unwrap_or_else(chrono::Utc::now);
 
     // Parse commands (messages starting with /)
-    let content = if content_text.starts_with('/') {
-        let parts: Vec<&str> = content_text.splitn(2, ' ').collect();
+    let content = if effective_content.starts_with('/') {
+        let parts: Vec<&str> = effective_content.splitn(2, ' ').collect();
         let cmd_name = &parts[0][1..];
         let args = if parts.len() > 1 {
             parts[1].split_whitespace().map(String::from).collect()
@@ -658,7 +585,7 @@ async fn parse_discord_message(
             args,
         }
     } else {
-        ChannelContent::Text(content_text.to_string())
+        ChannelContent::Text(effective_content.to_string())
     };
 
     // Determine if this is a group message (guild_id present = server channel)
@@ -672,8 +599,8 @@ async fn parse_discord_message(
             .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(bid.as_str())))
             .unwrap_or(false);
         // Also check content for <@bot_id> or <@!bot_id> patterns
-        let mentioned_in_content =
-            content_text.contains(&format!("<@{bid}>")) || content_text.contains(&format!("<@!{bid}>"));
+        let mentioned_in_content = effective_content.contains(&format!("<@{bid}>"))
+            || effective_content.contains(&format!("<@!{bid}>"));
         mentioned_in_array || mentioned_in_content
     } else {
         false
@@ -701,6 +628,42 @@ async fn parse_discord_message(
     })
 }
 
+/// Call the local transcription service to convert a voice message to text.
+async fn transcribe_voice(
+    client: &reqwest::Client,
+    audio_url: &str,
+    bot_token: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let body = serde_json::json!({
+        "url": audio_url,
+        "token": bot_token
+    });
+
+    let resp = client
+        .post("http://localhost:5003/transcribe")
+        .json(&body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("Transcription service returned {status}: {body_text}").into());
+    }
+
+    let result: serde_json::Value = resp.json().await?;
+    let text = result["text"]
+        .as_str()
+        .ok_or("Missing 'text' in transcription response")?;
+
+    if text.is_empty() {
+        return Err("Transcription returned empty text".into());
+    }
+
+    Ok(text.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,7 +684,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert_eq!(msg.sender.display_name, "alice");
         assert_eq!(msg.sender.platform_id, "ch1");
@@ -743,7 +706,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_none());
     }
 
@@ -763,7 +726,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_none());
     }
 
@@ -784,11 +747,11 @@ mod tests {
         });
 
         // Not in allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_some());
     }
 
@@ -807,7 +770,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await.unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -832,7 +795,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_none());
     }
 
@@ -851,7 +814,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await.unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
     }
 
@@ -873,7 +836,7 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert!(
             matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message content")
@@ -896,15 +859,15 @@ mod tests {
         });
 
         // Not in allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_none());
 
         // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_some());
 
         // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await;
         assert!(msg.is_some());
     }
 
@@ -927,7 +890,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await.unwrap();
         assert!(msg.is_group);
         assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
 
@@ -945,7 +908,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true).await.unwrap();
+        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await.unwrap();
         assert!(msg2.is_group);
         assert!(!msg2.metadata.contains_key("was_mentioned"));
     }
@@ -965,8 +928,67 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await.unwrap();
         assert!(!msg.is_group);
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_voice_message_no_service() {
+        // Voice message with audio attachment but no transcription service running.
+        // Should produce a "[Voice message - transcription failed]" message.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "",
+            "flags": VOICE_MESSAGE_FLAG,
+            "attachments": [{
+                "id": "att1",
+                "filename": "voice-message.ogg",
+                "content_type": "audio/ogg",
+                "url": "https://cdn.discordapp.com/attachments/123/456/voice-message.ogg",
+                "size": 12345
+            }],
+            "author": {
+                "id": "user456",
+                "username": "alice",
+                "discriminator": "0",
+                "bot": false
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "test-token").await;
+        let msg = msg.expect("Voice message should not be None");
+        match &msg.content {
+            ChannelContent::Text(t) => {
+                assert!(
+                    t.contains("Voice message"),
+                    "Expected voice message indicator, got: {t}"
+                );
+            }
+            other => panic!("Expected Text content for voice message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_empty_content_no_voice() {
+        // Empty content without voice flag/attachment should still return None.
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "",
+            "author": {
+                "id": "user1",
+                "username": "alice",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "").await;
+        assert!(msg.is_none());
     }
 
     #[test]
