@@ -419,6 +419,29 @@ pub async fn run_agent_loop(
                 } else {
                     text
                 };
+                // Filter provider error strings that leaked into the response.
+                // These come from CLI shelling errors (spawnSync, Claude CLI crashes)
+                // and should never be forwarded to channels as assistant content.
+                let text = if text.starts_with("[Claude CLI error:")
+                    || text.starts_with("[Error:")
+                    || text.starts_with("spawnSync")
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        leaked_error = %text.chars().take(120).collect::<String>(),
+                        "Provider error string leaked into response — filtering"
+                    );
+                    if iteration == 0 {
+                        messages.push(Message::assistant("[provider error]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
+                    "[The agent encountered a temporary provider error. Please try again.]"
+                        .to_string()
+                } else {
+                    text
+                };
+
                 final_response = text.clone();
                 session.messages.push(Message::assistant(text));
 
@@ -1334,6 +1357,29 @@ pub async fn run_agent_loop_streaming(
                 } else {
                     text
                 };
+                // Filter provider error strings that leaked into the response.
+                // These come from CLI shelling errors (spawnSync, Claude CLI crashes)
+                // and should never be forwarded to channels as assistant content.
+                let text = if text.starts_with("[Claude CLI error:")
+                    || text.starts_with("[Error:")
+                    || text.starts_with("spawnSync")
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        leaked_error = %text.chars().take(120).collect::<String>(),
+                        "Provider error string leaked into response — filtering"
+                    );
+                    if iteration == 0 {
+                        messages.push(Message::assistant("[provider error]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
+                    "[The agent encountered a temporary provider error. Please try again.]"
+                        .to_string()
+                } else {
+                    text
+                };
+
                 final_response = text.clone();
                 session.messages.push(Message::assistant(text));
 
