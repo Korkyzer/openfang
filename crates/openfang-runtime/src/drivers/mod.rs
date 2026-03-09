@@ -289,10 +289,12 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
     }
 
-    // Claude Code CLI — subprocess-based, no API key needed
+    // Claude Code CLI is disabled in OpenFang runtime.
+    // Claude-backed tasks should go through Anthropic or the meta-router, not a local CLI subprocess.
     if provider == "claude-code" {
-        let cli_path = config.base_url.clone();
-        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(cli_path)));
+        return Err(LlmError::Http(
+            "The claude-code provider is disabled. Use the anthropic provider or the meta-router instead.".to_string(),
+        ));
     }
 
     // GitHub Copilot — wraps OpenAI-compatible driver with automatic token exchange.

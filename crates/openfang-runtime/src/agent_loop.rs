@@ -419,6 +419,29 @@ pub async fn run_agent_loop(
                 } else {
                     text
                 };
+                // Filter provider error strings that leaked into the response.
+                // These come from CLI shelling errors (spawnSync, Claude CLI crashes)
+                // and should never be forwarded to channels as assistant content.
+                let text = if text.starts_with("[Claude CLI error:")
+                    || text.starts_with("[Error:")
+                    || text.starts_with("spawnSync")
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        leaked_error = %text.chars().take(120).collect::<String>(),
+                        "Provider error string leaked into response — filtering"
+                    );
+                    if iteration == 0 {
+                        messages.push(Message::assistant("[provider error]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
+                    "[The agent encountered a temporary provider error. Please try again.]"
+                        .to_string()
+                } else {
+                    text
+                };
+
                 final_response = text.clone();
                 session.messages.push(Message::assistant(text));
 
@@ -703,23 +726,6 @@ pub async fn run_agent_loop(
                              Do NOT retry denied tools. Explain to the user what you \
                              wanted to do and that it requires their approval.]",
                             denial_count
-                        ),
-                    });
-                }
-
-                // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
-                let non_denial_errors = error_count.saturating_sub(denial_count);
-                if non_denial_errors > 0 {
-                    tool_result_blocks.push(ContentBlock::Text {
-                        text: format!(
-                            "[System: {} tool(s) returned errors. Report the error honestly \
-                             to the user. Do NOT fabricate results or pretend the tool succeeded. \
-                             If a search or fetch failed, tell the user it failed and suggest \
-                             alternatives instead of making up data.]",
-                            non_denial_errors
                         ),
                     });
                 }
@@ -1351,6 +1357,29 @@ pub async fn run_agent_loop_streaming(
                 } else {
                     text
                 };
+                // Filter provider error strings that leaked into the response.
+                // These come from CLI shelling errors (spawnSync, Claude CLI crashes)
+                // and should never be forwarded to channels as assistant content.
+                let text = if text.starts_with("[Claude CLI error:")
+                    || text.starts_with("[Error:")
+                    || text.starts_with("spawnSync")
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        leaked_error = %text.chars().take(120).collect::<String>(),
+                        "Provider error string leaked into response — filtering"
+                    );
+                    if iteration == 0 {
+                        messages.push(Message::assistant("[provider error]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
+                    "[The agent encountered a temporary provider error. Please try again.]"
+                        .to_string()
+                } else {
+                    text
+                };
+
                 final_response = text.clone();
                 session.messages.push(Message::assistant(text));
 
@@ -1644,23 +1673,6 @@ pub async fn run_agent_loop_streaming(
                              Do NOT retry denied tools. Explain to the user what you \
                              wanted to do and that it requires their approval.]",
                             denial_count
-                        ),
-                    });
-                }
-
-                // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
-                let non_denial_errors = error_count.saturating_sub(denial_count);
-                if non_denial_errors > 0 {
-                    tool_result_blocks.push(ContentBlock::Text {
-                        text: format!(
-                            "[System: {} tool(s) returned errors. Report the error honestly \
-                             to the user. Do NOT fabricate results or pretend the tool succeeded. \
-                             If a search or fetch failed, tell the user it failed and suggest \
-                             alternatives instead of making up data.]",
-                            non_denial_errors
                         ),
                     });
                 }

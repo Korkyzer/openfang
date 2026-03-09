@@ -325,8 +325,7 @@ impl LlmDriver for ClaudeCodeDriver {
 
 /// Check if the Claude Code CLI is available.
 pub fn claude_code_available() -> bool {
-    ClaudeCodeDriver::detect().is_some()
-        || claude_credentials_exist()
+    false
 }
 
 /// Check if Claude credentials file exists (~/.claude/.credentials.json).
