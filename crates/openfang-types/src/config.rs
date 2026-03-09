@@ -1605,6 +1605,10 @@ pub struct DiscordConfig {
     /// Set to false to allow bot-to-bot interactions in multi-agent setups.
     #[serde(default = "default_true")]
     pub ignore_bots: bool,
+    /// Channel IDs where the bot listens without requiring @mention.
+    /// Use ["all"] to listen on every channel. Empty = mention-only (default).
+    #[serde(default)]
+    pub ambient_channels: Vec<String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1619,6 +1623,7 @@ impl Default for DiscordConfig {
             default_agent: None,
             intents: 37376,
             ignore_bots: true,
+            ambient_channels: vec![],
             overrides: ChannelOverrides::default(),
         }
     }

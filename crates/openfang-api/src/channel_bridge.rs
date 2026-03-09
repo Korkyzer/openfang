@@ -1044,6 +1044,7 @@ pub async fn start_channel_bridge_with_config(
                 dc_config.allowed_users.clone(),
                 dc_config.ignore_bots,
                 dc_config.intents,
+                dc_config.ambient_channels.clone(),
             ));
             adapters.push((adapter, dc_config.default_agent.clone()));
         }
