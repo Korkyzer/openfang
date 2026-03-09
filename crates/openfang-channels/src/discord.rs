@@ -122,15 +122,106 @@ impl DiscordAdapter {
         Ok(())
     }
 
-    /// Send typing indicator to a Discord channel.
+    /// Send a message and return the message ID.
+    async fn api_send_message_with_id(
+        &self,
+        channel_id: &str,
+        text: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let body = serde_json::json!({ "content": text });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        let data: serde_json::Value = resp.json().await?;
+        let msg_id = data["id"].as_str().unwrap_or("").to_string();
+        Ok(msg_id)
+    }
+
+    /// Edit an existing message by ID.
+    async fn api_edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let chunks = split_message(text, DISCORD_MSG_LIMIT);
+
+        // Edit original with first chunk
+        if let Some(first) = chunks.first() {
+            let body = serde_json::json!({ "content": first });
+            let resp = self
+                .client
+                .patch(&url)
+                .header("Authorization", format!("Bot {}", self.token.as_str()))
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                warn!("Discord editMessage failed: {body_text}");
+            }
+        }
+
+        // Send remaining chunks as new messages
+        if chunks.len() > 1 {
+            let send_url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+            for chunk in chunks.iter().skip(1) {
+                let body = serde_json::json!({ "content": chunk });
+                let _ = self
+                    .client
+                    .post(&send_url)
+                    .header("Authorization", format!("Bot {}", self.token.as_str()))
+                    .json(&body)
+                    .send()
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete a message by ID.
+    async fn api_delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord deleteMessage failed: {body_text}");
+        }
+        Ok(())
+    }
+
+        /// Send typing indicator to a Discord channel.
     async fn api_send_typing(&self, channel_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/typing");
-        let _ = self
+        let resp = self
             .client
             .post(&url)
             .header("Authorization", format!("Bot {}", self.token.as_str()))
             .send()
             .await?;
+        let status = resp.status();
+        if status.is_success() {
+            info!("Discord typing sent to channel {channel_id} (status={status})");
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            warn!("Discord typing FAILED for channel {channel_id}: status={status} body={body}");
+        }
         Ok(())
     }
 }
@@ -192,12 +283,34 @@ impl ChannelAdapter for DiscordAdapter {
                 info!("Discord gateway connected");
 
                 let (mut ws_tx, mut ws_rx) = ws_stream.split();
-                let mut _heartbeat_interval: Option<u64> = None;
+                let mut heartbeat_ticker: Option<tokio::time::Interval> = None;
 
                 // Inner message loop — returns true if we should reconnect
                 let should_reconnect = 'inner: loop {
                     let msg = tokio::select! {
                         msg = ws_rx.next() => msg,
+                        _ = async {
+                            if let Some(ref mut ticker) = heartbeat_ticker {
+                                ticker.tick().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            // Send periodic heartbeat to keep connection alive
+                            let seq = *sequence.read().await;
+                            let hb = serde_json::json!({ "op": opcode::HEARTBEAT, "d": seq });
+                            if let Err(e) = ws_tx
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    serde_json::to_string(&hb).unwrap(),
+                                ))
+                                .await
+                            {
+                                warn!("Discord: failed to send heartbeat: {e}");
+                                break 'inner true;
+                            }
+                            debug!("Discord: heartbeat sent (seq={seq:?})");
+                            continue;
+                        },
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
                                 info!("Discord shutdown requested");
@@ -248,8 +361,15 @@ impl ChannelAdapter for DiscordAdapter {
                         opcode::HELLO => {
                             let interval =
                                 payload["d"]["heartbeat_interval"].as_u64().unwrap_or(45000);
-                            _heartbeat_interval = Some(interval);
-                            debug!("Discord HELLO: heartbeat_interval={interval}ms");
+                            // Start periodic heartbeat timer
+                            let jittered = interval * 3 / 4;
+                            let mut ticker = tokio::time::interval_at(
+                                tokio::time::Instant::now() + std::time::Duration::from_millis(jittered),
+                                std::time::Duration::from_millis(interval),
+                            );
+                            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            heartbeat_ticker = Some(ticker);
+                            info!("Discord HELLO: heartbeat_interval={interval}ms (first in {jittered}ms)");
 
                             // Try RESUME if we have a session, otherwise IDENTIFY
                             let has_session = session_id_store.read().await.is_some();
@@ -422,6 +542,41 @@ impl ChannelAdapter for DiscordAdapter {
 
     async fn send_typing(&self, user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
         self.api_send_typing(&user.platform_id).await
+    }
+
+    async fn send_placeholder(
+        &self,
+        user: &ChannelUser,
+        text: &str,
+        _thread_id: Option<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let msg_id = self.api_send_message_with_id(&user.platform_id, text).await?;
+        if msg_id.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(msg_id))
+        }
+    }
+
+    async fn delete_message(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.api_delete_message(&user.platform_id, message_id).await
+    }
+
+        async fn edit_message(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+        content: ChannelContent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let text = match content {
+            ChannelContent::Text(ref t) => t.as_str(),
+            _ => "(Unsupported content type)",
+        };
+        self.api_edit_message(&user.platform_id, message_id, text).await
     }
 
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
