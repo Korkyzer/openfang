@@ -267,7 +267,7 @@ fn default_vision_model(provider: &str) -> &str {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514",
         "openai" => "gpt-4o",
-        "gemini" => "gemini-2.5-flash",
+        "gemini" => "gemini-3.1-pro-preview",
         _ => "unknown",
     }
 }

@@ -1609,6 +1609,10 @@ pub struct DiscordConfig {
     /// Use ["all"] to listen on every channel. Empty = mention-only (default).
     #[serde(default)]
     pub ambient_channels: Vec<String>,
+    /// Map Discord channel IDs to agent names for per-channel routing.
+    /// e.g. { "1479472512160108736" = "asa" }
+    #[serde(default)]
+    pub channel_agents: std::collections::HashMap<String, String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1624,6 +1628,7 @@ impl Default for DiscordConfig {
             intents: 37376,
             ignore_bots: true,
             ambient_channels: vec![],
+            channel_agents: std::collections::HashMap::new(),
             overrides: ChannelOverrides::default(),
         }
     }

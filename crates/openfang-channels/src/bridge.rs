@@ -218,6 +218,20 @@ pub trait ChannelBridgeHandle: Send + Sync {
     async fn disk_status_text(&self) -> String {
         "Disk status is not available.".to_string()
     }
+
+    /// Send a message while optionally streaming phase updates.
+    ///
+    /// Implementations that do not support phase updates can ignore `phase_tx`
+    /// and fall back to a standard request/response turn.
+    async fn send_message_with_phases(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        phase_tx: tokio::sync::mpsc::Sender<(String, Option<String>)>,
+    ) -> Result<String, String> {
+        drop(phase_tx);
+        self.send_message(agent_id, message).await
+    }
 }
 
 /// Per-channel rate limiter tracking message timestamps per user.

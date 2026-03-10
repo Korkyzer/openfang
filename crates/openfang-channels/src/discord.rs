@@ -139,6 +139,52 @@ impl DiscordAdapter {
             .await?;
         Ok(())
     }
+
+    /// Post a new message and return its Discord message ID.
+    async fn api_send_message_with_id(
+        &self,
+        channel_id: &str,
+        text: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let body = serde_json::json!({ "content": text });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        let json: serde_json::Value = resp.json().await?;
+        Ok(json["id"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Edit an existing Discord message in-place via PATCH.
+    async fn api_edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let clamped = if text.len() > 1990 { &text[..1990] } else { text };
+        let body = serde_json::json!({ "content": clamped });
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let bt = resp.text().await.unwrap_or_default();
+            warn!("Discord editMessage failed: {bt}");
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -468,6 +514,31 @@ impl ChannelAdapter for DiscordAdapter {
 
     async fn send_typing(&self, user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
         self.api_send_typing(&user.platform_id).await
+    }
+
+    async fn send_with_id(
+        &self,
+        user: &ChannelUser,
+        content: ChannelContent,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let text = match &content {
+            ChannelContent::Text(t) => t.as_str(),
+            _ => "(Unsupported content type)",
+        };
+        self.api_send_message_with_id(&user.platform_id, text).await
+    }
+
+    async fn edit_message(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+        content: ChannelContent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let text = match content {
+            ChannelContent::Text(t) => t,
+            _ => return Ok(()),
+        };
+        self.api_edit_message(&user.platform_id, message_id, &text).await
     }
 
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {

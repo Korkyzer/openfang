@@ -11,7 +11,7 @@ use openfang_types::agent::{AgentId, AgentState};
 use tracing::{debug, warn};
 
 /// Default heartbeat check interval (seconds).
-const DEFAULT_CHECK_INTERVAL_SECS: u64 = 30;
+const DEFAULT_CHECK_INTERVAL_SECS: u64 = 150;
 
 /// Multiplier: agent is considered unresponsive if inactive for this many
 /// multiples of its heartbeat interval.
@@ -201,7 +201,7 @@ mod tests {
     fn test_heartbeat_config_default() {
         let config = HeartbeatConfig::default();
         assert_eq!(config.check_interval_secs, 30);
-        assert_eq!(config.default_timeout_secs, 60);
+        assert_eq!(config.default_timeout_secs, 300);
     }
 
     #[test]

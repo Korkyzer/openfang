@@ -2054,6 +2054,36 @@ impl OpenFangKernel {
             }
         }
 
+        // WAL: Check for interrupted session state
+        let mut interrupted_task: Option<String> = None;
+        if let Some(ref workspace) = entry.manifest.workspace {
+            let state_path = workspace.join("SESSION-STATE.md");
+            if state_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&state_path) {
+                    if content.starts_with("status: in-progress") {
+                        // Check if started > 5 minutes ago
+                        if let Some(started_line) = content.lines().find(|l| l.starts_with("started: ")) {
+                            let ts_str = started_line.trim_start_matches("started: ");
+                            if let Ok(started) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                                let elapsed = chrono::Utc::now() - started.with_timezone(&chrono::Utc);
+                                if elapsed > chrono::Duration::minutes(5) {
+                                    if let Some(task_line) = content.lines().find(|l| l.starts_with("task: ")) {
+                                        let task = task_line.trim_start_matches("task: ");
+                                        interrupted_task = Some(task.to_string());
+                                        tracing::info!(
+                                            agent = %entry.name,
+                                            task = %task,
+                                            "WAL: Detected interrupted session, will inject recovery context"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
@@ -2283,6 +2313,30 @@ impl OpenFangKernel {
             message.to_string()
         };
 
+        // WAL: Prepend recovery context if previous session was interrupted
+        let message_with_links = if let Some(ref interrupted) = interrupted_task {
+            format!("\u{26a0}\u{fe0f} Previous session was interrupted while working on: {interrupted}. Resume if the current request is related.\n\n{message_with_links}")
+        } else {
+            message_with_links
+        };
+
+        // WAL: Write session state before agent processing
+        let wal_task_preview = message.chars().take(100).collect::<String>();
+        let wal_session_id = entry.session_id.to_string();
+        if let Some(ref workspace) = manifest.workspace {
+            let state_path = workspace.join("SESSION-STATE.md");
+            let state_content = format!(
+                "status: in-progress\ntask: {}\nstarted: {}\nsession_id: {}",
+                wal_task_preview,
+                chrono::Utc::now().to_rfc3339(),
+                wal_session_id,
+            );
+            if let Err(e) = std::fs::write(&state_path, &state_content) {
+                tracing::warn!(path = %state_path.display(), error = %e, "Failed to write SESSION-STATE.md");
+            }
+        }
+        let wal_start_ts = chrono::Utc::now().to_rfc3339();
+
         let result = run_agent_loop(
             &manifest,
             &message_with_links,
@@ -2315,6 +2369,20 @@ impl OpenFangKernel {
         )
         .await
         .map_err(KernelError::OpenFang)?;
+
+        // WAL: Update session state after successful completion
+        if let Some(ref workspace) = manifest.workspace {
+            let state_path = workspace.join("SESSION-STATE.md");
+            let state_content = format!(
+                "status: complete\ntask: {}\nstarted: {}\ncompleted: {}",
+                wal_task_preview,
+                wal_start_ts,
+                chrono::Utc::now().to_rfc3339(),
+            );
+            if let Err(e) = std::fs::write(&state_path, &state_content) {
+                tracing::warn!(path = %state_path.display(), error = %e, "Failed to update SESSION-STATE.md");
+            }
+        }
 
         // Append new messages to canonical session for cross-channel memory
         if session.messages.len() > messages_before {
@@ -4991,9 +5059,52 @@ async fn cron_deliver_response(
     match delivery {
         CronDelivery::None => {}
         CronDelivery::Channel { channel, to } => {
-            tracing::debug!(channel = %channel, to = %to, "Cron: delivering to channel");
+            // Determine adapter name and recipient
+            let (adapter_name, recipient) = if kernel.channel_adapters.contains_key(channel) {
+                // channel is an adapter name (e.g. "discord"), to is the recipient
+                let rcpt = to.as_deref().unwrap_or(channel);
+                (channel.clone(), rcpt.to_string())
+            } else {
+                // channel is a platform-specific ID (e.g. Discord channel ID)
+                // Try to find the right adapter — default to "discord"
+                ("discord".to_string(), channel.clone())
+            };
+
+            if let Some(adapter) = kernel.channel_adapters.get(&adapter_name) {
+                let user = openfang_channels::types::ChannelUser {
+                    platform_id: recipient.clone(),
+                    display_name: recipient.clone(),
+                    openfang_user: None,
+                };
+                match adapter.send(
+                    &user,
+                    openfang_channels::types::ChannelContent::Text(response.to_string()),
+                ).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            adapter = %adapter_name,
+                            recipient = %recipient,
+                            "Cron: delivered response to channel"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            adapter = %adapter_name,
+                            recipient = %recipient,
+                            error = %e,
+                            "Cron: channel delivery failed"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    channel = %channel,
+                    "Cron: no adapter found for channel delivery"
+                );
+            }
+
             // Persist as last channel for this agent (survives restarts)
-            let kv_val = serde_json::json!({"channel": channel, "recipient": to});
+            let kv_val = serde_json::json!({"channel": adapter_name, "recipient": recipient});
             let _ = kernel
                 .memory
                 .structured_set(agent_id, "delivery.last_channel", kv_val);
@@ -5007,11 +5118,35 @@ async fn cron_deliver_response(
                     let channel = val["channel"].as_str().unwrap_or("");
                     let recipient = val["recipient"].as_str().unwrap_or("");
                     if !channel.is_empty() && !recipient.is_empty() {
-                        tracing::info!(
-                            channel = %channel,
-                            recipient = %recipient,
-                            "Cron: delivering to last channel"
-                        );
+                        if let Some(adapter) = kernel.channel_adapters.get(channel) {
+                            let user = openfang_channels::types::ChannelUser {
+                                platform_id: recipient.to_string(),
+                                display_name: recipient.to_string(),
+                                openfang_user: None,
+                            };
+                            match adapter.send(
+                                &user,
+                                openfang_channels::types::ChannelContent::Text(response.to_string()),
+                            ).await {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        channel = %channel,
+                                        recipient = %recipient,
+                                        "Cron: delivered to last channel"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        channel = %channel,
+                                        recipient = %recipient,
+                                        error = %e,
+                                        "Cron: last channel delivery failed"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(channel = %channel, "Cron: adapter not found for last channel");
+                        }
                     }
                 }
                 _ => {

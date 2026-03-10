@@ -49,7 +49,7 @@ const TOOL_TIMEOUT_SECS: u64 = 120;
 const MAX_CONTINUATIONS: u32 = 5;
 
 /// Maximum message history size before auto-trimming to prevent context overflow.
-const MAX_HISTORY_MESSAGES: usize = 20;
+const MAX_HISTORY_MESSAGES: usize = 60;
 
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
@@ -2087,7 +2087,7 @@ mod tests {
 
     #[test]
     fn test_max_history_messages() {
-        assert_eq!(MAX_HISTORY_MESSAGES, 20);
+        assert_eq!(MAX_HISTORY_MESSAGES, 60);
     }
 
     // --- Integration tests for empty response guards ---
@@ -2570,7 +2570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_history_messages_constant() {
-        assert_eq!(MAX_HISTORY_MESSAGES, 20);
+        assert_eq!(MAX_HISTORY_MESSAGES, 60);
     }
 
     #[tokio::test]

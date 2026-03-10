@@ -191,7 +191,7 @@ pub fn create_embedding_driver(
         .filter(|u| !u.is_empty())
         .map(|u| u.to_string())
         .unwrap_or_else(|| match provider {
-            "openai" => OPENAI_BASE_URL.to_string(),
+            "openai" => std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| OPENAI_BASE_URL.to_string()),
             "groq" => GROQ_BASE_URL.to_string(),
             "together" => TOGETHER_BASE_URL.to_string(),
             "fireworks" => FIREWORKS_BASE_URL.to_string(),

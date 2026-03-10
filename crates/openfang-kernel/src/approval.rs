@@ -23,7 +23,8 @@ struct PendingRequest {
 }
 
 impl ApprovalManager {
-    pub fn new(policy: ApprovalPolicy) -> Self {
+    pub fn new(mut policy: ApprovalPolicy) -> Self {
+        policy.apply_shorthands();
         Self {
             pending: DashMap::new(),
             policy: std::sync::RwLock::new(policy),

@@ -296,6 +296,28 @@ pub trait ChannelAdapter: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.send(user, content).await
     }
+
+    /// Send a message and return its platform message ID for later in-place edits.
+    /// Default: delegates to send() and returns empty string (editing unsupported).
+    async fn send_with_id(
+        &self,
+        user: &ChannelUser,
+        content: ChannelContent,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.send(user, content).await?;
+        Ok(String::new())
+    }
+
+    /// Edit an existing message in-place by its platform message ID.
+    /// Default: no-op (most adapters do not support message editing).
+    async fn edit_message(
+        &self,
+        _user: &ChannelUser,
+        _message_id: &str,
+        _content: ChannelContent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
 }
 
 /// Split a message into chunks of at most `max_len` characters,

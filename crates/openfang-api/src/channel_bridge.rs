@@ -140,6 +140,34 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(result.response)
     }
 
+    async fn send_message_with_phases(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        phase_tx: tokio::sync::mpsc::Sender<(String, Option<String>)>,
+    ) -> Result<String, String> {
+        use openfang_runtime::llm_driver::StreamEvent;
+
+        let kernel = &self.kernel;
+        let (mut rx, join_handle) = kernel
+            .send_message_streaming(agent_id, message, None)
+            .map_err(|e| format!("{e}"))?;
+
+        // Drain stream events, forwarding phase changes to the channel bridge.
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::PhaseChange { phase, detail } = event {
+                // Ignore send errors (receiver may have disconnected).
+                let _ = phase_tx.send((phase, detail)).await;
+            }
+        }
+
+        let result = join_handle
+            .await
+            .map_err(|e| format!("join error: {e}"))?
+            .map_err(|e| format!("{e}"))?
+;
+        Ok(result.response)
+    }
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
         Ok(self.kernel.registry.find_by_name(name).map(|e| e.id))
     }
@@ -1697,6 +1725,39 @@ pub async fn start_channel_bridge_with_config(
         info!(count = bindings.len(), "Loaded agent bindings into router");
     }
     router.load_broadcast(kernel.broadcast.clone());
+
+    // Wire Discord per-channel agent routing (channel_agents config)
+    if let Some(ref dc_config) = config.discord {
+        if !dc_config.channel_agents.is_empty() {
+            // Register all agents in name cache so we can resolve by name
+            for entry in kernel.registry.list() {
+                router.register_agent(entry.name.clone(), entry.id);
+            }
+            let channel_key = "Discord".to_string();
+            for (channel_id, agent_name) in &dc_config.channel_agents {
+                let agent_id = match handle.find_agent_by_name(agent_name).await {
+                    Ok(Some(id)) => Some(id),
+                    _ => match handle.spawn_agent_by_name(agent_name).await {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            warn!(
+                                "Discord channel_agents: could not find or spawn agent '{}': {e}",
+                                agent_name
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some(agent_id) = agent_id {
+                    // In Discord, sender.platform_id = channel_id, so direct routes work
+                    router.set_direct_route(channel_key.clone(), channel_id.clone(), agent_id);
+                    info!(
+                        "Discord channel {channel_id} -> agent {agent_name} ({agent_id})"
+                    );
+                }
+            }
+        }
+    }
 
     let bridge_handle: Arc<dyn ChannelBridgeHandle> = Arc::new(KernelBridgeAdapter {
         kernel: kernel.clone(),

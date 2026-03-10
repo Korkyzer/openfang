@@ -212,7 +212,6 @@ impl LlmDriver for OpenAIDriver {
                 (Role::User, MessageContent::Blocks(blocks)) => {
                     // Handle tool results and images in user messages
                     let mut parts: Vec<OaiContentPart> = Vec::new();
-                    let mut has_tool_results = false;
                     for block in blocks {
                         match block {
                             ContentBlock::ToolResult {
@@ -220,7 +219,6 @@ impl LlmDriver for OpenAIDriver {
                                 content,
                                 ..
                             } => {
-                                has_tool_results = true;
                                 oai_messages.push(OaiMessage {
                                     role: "tool".to_string(),
                                     content: Some(OaiMessageContent::Text(if content.is_empty() {
@@ -246,7 +244,7 @@ impl LlmDriver for OpenAIDriver {
                             _ => {}
                         }
                     }
-                    if !parts.is_empty() && !has_tool_results {
+                    if !parts.is_empty() {
                         oai_messages.push(OaiMessage {
                             role: "user".to_string(),
                             content: Some(OaiMessageContent::Parts(parts)),
@@ -591,24 +589,45 @@ impl LlmDriver for OpenAIDriver {
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
+                    let mut parts: Vec<OaiContentPart> = Vec::new();
                     for block in blocks {
-                        if let ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } = block
-                        {
-                            oai_messages.push(OaiMessage {
-                                role: "tool".to_string(),
-                                content: Some(OaiMessageContent::Text(if content.is_empty() {
-                                    "(empty)".to_string()
-                                } else {
-                                    content.clone()
-                                })),
-                                tool_calls: None,
-                                tool_call_id: Some(tool_use_id.clone()),
-                            });
+                        match block {
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                ..
+                            } => {
+                                oai_messages.push(OaiMessage {
+                                    role: "tool".to_string(),
+                                    content: Some(OaiMessageContent::Text(if content.is_empty() {
+                                        "(empty)".to_string()
+                                    } else {
+                                        content.clone()
+                                    })),
+                                    tool_calls: None,
+                                    tool_call_id: Some(tool_use_id.clone()),
+                                });
+                            }
+                            ContentBlock::Text { text } => {
+                                parts.push(OaiContentPart::Text { text: text.clone() });
+                            }
+                            ContentBlock::Image { media_type, data } => {
+                                parts.push(OaiContentPart::ImageUrl {
+                                    image_url: OaiImageUrl {
+                                        url: format!("data:{media_type};base64,{data}"),
+                                    },
+                                });
+                            }
+                            _ => {}
                         }
+                    }
+                    if !parts.is_empty() {
+                        oai_messages.push(OaiMessage {
+                            role: "user".to_string(),
+                            content: Some(OaiMessageContent::Parts(parts)),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
                     }
                 }
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {

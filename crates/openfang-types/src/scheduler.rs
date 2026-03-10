@@ -136,10 +136,11 @@ pub enum CronDelivery {
     None,
     /// Deliver to a specific channel and recipient.
     Channel {
-        /// Channel identifier (e.g. `"telegram"`, `"slack"`).
+        /// Channel identifier (e.g. `"telegram"`, `"slack"`, or a platform channel ID).
         channel: String,
-        /// Recipient in the channel.
-        to: String,
+        /// Recipient in the channel (optional — if omitted, `channel` is used as the recipient).
+        #[serde(default)]
+        to: Option<String>,
     },
     /// Deliver to the last channel the agent interacted on.
     LastChannel,
@@ -309,8 +310,10 @@ impl CronJob {
                 if channel.is_empty() {
                     return Err("delivery channel must not be empty".into());
                 }
-                if to.is_empty() {
-                    return Err("delivery recipient must not be empty".into());
+                if let Some(ref t) = to {
+                    if t.is_empty() {
+                        return Err("delivery recipient must not be empty when specified".into());
+                    }
                 }
             }
             CronDelivery::Webhook { url } => {
@@ -697,7 +700,7 @@ mod tests {
         let mut job = valid_job();
         job.delivery = CronDelivery::Channel {
             channel: String::new(),
-            to: "user123".into(),
+            to: Some("user123".into()),
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("channel must not be empty"), "{err}");
@@ -708,10 +711,10 @@ mod tests {
         let mut job = valid_job();
         job.delivery = CronDelivery::Channel {
             channel: "slack".into(),
-            to: String::new(),
+            to: Some(String::new()),
         };
         let err = job.validate(0).unwrap_err();
-        assert!(err.contains("recipient must not be empty"), "{err}");
+        assert!(err.contains("recipient must not be empty when specified"), "{err}");
     }
 
     #[test]
@@ -719,7 +722,7 @@ mod tests {
         let mut job = valid_job();
         job.delivery = CronDelivery::Channel {
             channel: "telegram".into(),
-            to: "chat_12345".into(),
+            to: Some("chat_12345".into()),
         };
         assert!(job.validate(0).is_ok());
     }
