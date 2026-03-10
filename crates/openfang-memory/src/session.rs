@@ -716,7 +716,9 @@ impl SessionStore {
                             ContentBlock::Text { text } => {
                                 text_parts.push(text.clone());
                             }
-                            ContentBlock::ToolUse { id, name, input, .. } => {
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
                                 tool_parts.push(serde_json::json!({
                                     "type": "tool_use",
                                     "id": id,
@@ -970,7 +972,9 @@ mod tests {
         let store = setup();
         let agent_id = AgentId::new();
         let mut session = store.create_session(agent_id).unwrap();
-        session.messages.push(Message::user("Need rust sqlite search"));
+        session
+            .messages
+            .push(Message::user("Need rust sqlite search"));
         session
             .messages
             .push(Message::assistant("Use FTS5 for fast lookup"));

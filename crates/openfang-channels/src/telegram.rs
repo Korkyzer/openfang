@@ -371,7 +371,14 @@ impl ChannelAdapter for TelegramAdapter {
                     }
 
                     // Parse the message
-                    let msg = match parse_telegram_update(update, &allowed_users, token.as_str(), &client).await {
+                    let msg = match parse_telegram_update(
+                        update,
+                        &allowed_users,
+                        token.as_str(),
+                        &client,
+                    )
+                    .await
+                    {
                         Some(m) => m,
                         None => continue, // filtered out or unparseable
                     };
@@ -545,7 +552,10 @@ async fn parse_telegram_update(
             Some(url) => ChannelContent::Image { url, caption },
             None => ChannelContent::Text(format!(
                 "[Photo received{}]",
-                caption.as_deref().map(|c| format!(": {c}")).unwrap_or_default()
+                caption
+                    .as_deref()
+                    .map(|c| format!(": {c}"))
+                    .unwrap_or_default()
             )),
         }
     } else if message.get("document").is_some() {
@@ -606,7 +616,17 @@ pub fn calculate_backoff(current: Duration) -> Duration {
 /// Everything else (e.g. `<name>`, `<thinking>`) gets escaped to `&lt;...&gt;`.
 fn sanitize_telegram_html(text: &str) -> String {
     const ALLOWED: &[&str] = &[
-        "b", "i", "u", "s", "em", "strong", "a", "code", "pre", "blockquote", "tg-spoiler",
+        "b",
+        "i",
+        "u",
+        "s",
+        "em",
+        "strong",
+        "a",
+        "code",
+        "pre",
+        "blockquote",
+        "tg-spoiler",
         "tg-emoji",
     ];
 
@@ -685,7 +705,9 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client).await.unwrap();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client)
+            .await
+            .unwrap();
         assert_eq!(msg.channel, ChannelType::Telegram);
         assert_eq!(msg.sender.display_name, "Alice Smith");
         assert_eq!(msg.sender.platform_id, "111222333");
@@ -717,7 +739,9 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client).await.unwrap();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client)
+            .await
+            .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -785,7 +809,9 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client).await.unwrap();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client)
+            .await
+            .unwrap();
         assert_eq!(msg.channel, ChannelType::Telegram);
         assert_eq!(msg.sender.display_name, "Alice Smith");
         assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message!"));
@@ -821,7 +847,9 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client).await.unwrap();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client)
+            .await
+            .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agents");
@@ -845,7 +873,9 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client).await.unwrap();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client)
+            .await
+            .unwrap();
         assert!(matches!(msg.content, ChannelContent::Location { .. }));
     }
 }

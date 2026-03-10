@@ -54,12 +54,79 @@ use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 use tracing::{error, info, warn};
 
 /// Wraps `OpenFangKernel` to implement `ChannelBridgeHandle`.
 pub struct KernelBridgeAdapter {
     kernel: Arc<OpenFangKernel>,
     started_at: Instant,
+}
+
+const DISK_CLEANUP_SCRIPT: &str = "/root/openfang-tools/cleanup.sh";
+const DISK_STATUS_CMD: &str = r#"df -h / | awk 'NR==2 {print $5" ("$3"/"$2", "$4" free)"}'"#;
+
+#[derive(Debug, Default)]
+struct CleanupSummary {
+    before: Option<String>,
+    after: Option<String>,
+    disk_after_pct: Option<u8>,
+}
+
+impl CleanupSummary {
+    fn into_discord_message(self) -> Result<String, String> {
+        let before = self
+            .before
+            .ok_or_else(|| "cleanup output missing BEFORE".to_string())?;
+        let after = self
+            .after
+            .ok_or_else(|| "cleanup output missing AFTER".to_string())?;
+        let disk_after_pct = self
+            .disk_after_pct
+            .ok_or_else(|| "cleanup output missing DISK_AFTER_PCT".to_string())?;
+        let icon = match disk_after_pct {
+            86..=u8::MAX => "🔴",
+            71..=85 => "⚠️",
+            _ => "✅",
+        };
+
+        Ok(format!(
+            "🧹 Disk cleanup terminé\nAvant: {before}\nAprès:  {after}\n{icon} Disk: {disk_after_pct}%"
+        ))
+    }
+}
+
+fn parse_cleanup_summary(output: &str) -> CleanupSummary {
+    let mut summary = CleanupSummary::default();
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("DISK_AFTER_PCT=") {
+            summary.disk_after_pct = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("BEFORE=") {
+            summary.before = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("AFTER=") {
+            summary.after = Some(value.trim().to_string());
+        }
+    }
+    summary
+}
+
+async fn run_command_capture(mut command: Command) -> Result<String, String> {
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("failed to start command: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else if !stderr.is_empty() {
+        Err(stderr)
+    } else if !stdout.is_empty() {
+        Err(stdout)
+    } else {
+        Err(format!("command exited with status {}", output.status))
+    }
 }
 
 #[async_trait]
@@ -767,6 +834,62 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .map_err(|e| e.to_string())
     }
 
+    async fn authorize_named_channel_user(
+        &self,
+        channel_type: &str,
+        platform_id: &str,
+        expected_name: &str,
+        _action: &str,
+    ) -> Result<(), String> {
+        if self.kernel.auth.is_enabled() {
+            let user_id = self
+                .kernel
+                .auth
+                .identify(channel_type, platform_id)
+                .ok_or_else(|| "Unrecognized user. Contact an admin to get access.".to_string())?;
+            let identity = self
+                .kernel
+                .auth
+                .get_user(user_id)
+                .ok_or_else(|| "User identity not found.".to_string())?;
+            if identity.name.eq_ignore_ascii_case(expected_name) {
+                return Ok(());
+            }
+            return Err(format!("{expected_name} only."));
+        }
+
+        if channel_type == "discord" {
+            if let Some(discord) = self.kernel.config.channels.discord.as_ref() {
+                if discord.allowed_users.len() == 1 && discord.allowed_users[0] == platform_id {
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(format!("{expected_name} only."))
+    }
+
+    async fn disk_cleanup_text(&self) -> String {
+        let mut command = Command::new("bash");
+        command.arg(DISK_CLEANUP_SCRIPT);
+        match run_command_capture(command).await {
+            Ok(output) => parse_cleanup_summary(&output)
+                .into_discord_message()
+                .unwrap_or_else(|e| format!("Disk cleanup failed: {e}")),
+            Err(e) => format!("Disk cleanup failed: {e}"),
+        }
+    }
+
+    async fn disk_status_text(&self) -> String {
+        let mut command = Command::new("bash");
+        command.args(["-lc", DISK_STATUS_CMD]);
+        match run_command_capture(command).await {
+            Ok(status) if !status.is_empty() => format!("💾 Disk: {status}"),
+            Ok(_) => "Disk status unavailable.".to_string(),
+            Err(e) => format!("Disk status failed: {e}"),
+        }
+    }
+
     async fn record_delivery(
         &self,
         agent_id: AgentId,
@@ -1067,7 +1190,9 @@ pub async fn start_channel_bridge_with_config(
     // WhatsApp — supports Cloud API mode (access token) or Web/QR mode (gateway URL)
     if let Some(ref wa_config) = config.whatsapp {
         let cloud_token = read_token(&wa_config.access_token_env, "WhatsApp");
-        let gateway_url = std::env::var(&wa_config.gateway_url_env).ok().filter(|u| !u.is_empty());
+        let gateway_url = std::env::var(&wa_config.gateway_url_env)
+            .ok()
+            .filter(|u| !u.is_empty());
 
         if cloud_token.is_some() || gateway_url.is_some() {
             let token = cloud_token.unwrap_or_default();

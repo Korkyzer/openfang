@@ -281,7 +281,8 @@ impl ChannelAdapter for DiscordAdapter {
                             // Start periodic heartbeat timer
                             let jittered = interval * 3 / 4;
                             let mut ticker = tokio::time::interval_at(
-                                tokio::time::Instant::now() + std::time::Duration::from_millis(jittered),
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(jittered),
                                 std::time::Duration::from_millis(interval),
                             );
                             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -355,9 +356,17 @@ impl ChannelAdapter for DiscordAdapter {
                                 }
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
-                                    if let Some(msg) =
-                                        parse_discord_message(d, &bot_user_id, &allowed_guilds, &allowed_users, ignore_bots, &http_client, token.as_str(), &ambient_channels)
-                                            .await
+                                    if let Some(msg) = parse_discord_message(
+                                        d,
+                                        &bot_user_id,
+                                        &allowed_guilds,
+                                        &allowed_users,
+                                        ignore_bots,
+                                        &http_client,
+                                        token.as_str(),
+                                        &ambient_channels,
+                                    )
+                                    .await
                                     {
                                         debug!(
                                             "Discord {event_name} from {}: {:?}",
@@ -527,11 +536,8 @@ async fn parse_discord_message(
 
         if has_voice_flag || audio_attachment.is_some() {
             // Pick the audio attachment (or first attachment as fallback)
-            let attachment = audio_attachment.or_else(|| {
-                d["attachments"]
-                    .as_array()
-                    .and_then(|a| a.first())
-            });
+            let attachment =
+                audio_attachment.or_else(|| d["attachments"].as_array().and_then(|a| a.first()));
             if let Some(url) = attachment.and_then(|a| a["url"].as_str()) {
                 match transcribe_voice(http_client, url, bot_token).await {
                     Ok(text) => {
@@ -553,9 +559,7 @@ async fn parse_discord_message(
         None
     };
 
-    let effective_content = voice_transcription
-        .as_deref()
-        .unwrap_or(content_text);
+    let effective_content = voice_transcription.as_deref().unwrap_or(content_text);
 
     if effective_content.is_empty() {
         return None;
@@ -624,6 +628,7 @@ async fn parse_discord_message(
     let was_mentioned = explicitly_mentioned || is_ambient || is_voice;
 
     let mut metadata = HashMap::new();
+    metadata.insert("sender_id".to_string(), serde_json::json!(author_id));
     if was_mentioned {
         metadata.insert("was_mentioned".to_string(), serde_json::json!(true));
     }
@@ -701,10 +706,25 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert_eq!(msg.sender.display_name, "alice");
         assert_eq!(msg.sender.platform_id, "ch1");
+        assert_eq!(
+            msg.metadata.get("sender_id").and_then(|v| v.as_str()),
+            Some("user456")
+        );
         assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Hello agent!"));
     }
 
@@ -723,7 +743,17 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_none());
     }
 
@@ -743,7 +773,17 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_none());
     }
 
@@ -764,11 +804,31 @@ mod tests {
         });
 
         // Not in allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &["111".into(), "222".into()],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &["999".into()],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_some());
     }
 
@@ -787,7 +847,18 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -812,7 +883,17 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_none());
     }
 
@@ -831,7 +912,18 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
     }
 
@@ -853,7 +945,18 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert!(
             matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message content")
@@ -876,15 +979,45 @@ mod tests {
         });
 
         // Not in allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &["user111".into(), "user222".into()],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_none());
 
         // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &["user999".into()],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_some());
 
         // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_some());
     }
 
@@ -907,9 +1040,23 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(msg.is_group);
-        assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         // Message without mention in group
         let d2 = serde_json::json!({
@@ -925,7 +1072,18 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg2 = parse_discord_message(
+            &d2,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(msg2.is_group);
         assert!(!msg2.metadata.contains_key("was_mentioned"));
     }
@@ -945,7 +1103,18 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(!msg.is_group);
     }
 
@@ -975,7 +1144,17 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "test-token", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "test-token",
+            &[],
+        )
+        .await;
         let msg = msg.expect("Voice message should not be None");
         match &msg.content {
             ChannelContent::Text(t) => {
@@ -1004,7 +1183,17 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await;
         assert!(msg.is_none());
     }
 
@@ -1026,13 +1215,38 @@ mod tests {
         });
 
         // Without ambient: no mention
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &[]).await.unwrap();
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(!msg.metadata.contains_key("was_mentioned"));
 
         // With ambient_channels=["all"]: treated as mentioned
         let ambient = vec!["all".to_string()];
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &ambient).await.unwrap();
-        assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &ambient,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -1049,8 +1263,22 @@ mod tests {
             "author": { "id": "user1", "username": "alice", "discriminator": "0" },
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
-        let msg = parse_discord_message(&d1, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &ambient).await.unwrap();
-        assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
+        let msg = parse_discord_message(
+            &d1,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &ambient,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         // Different channel: not ambient
         let d2 = serde_json::json!({
@@ -1061,13 +1289,31 @@ mod tests {
             "author": { "id": "user1", "username": "alice", "discriminator": "0" },
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
-        let msg = parse_discord_message(&d2, &bot_id, &[], &[], true, &reqwest::Client::new(), "", &ambient).await.unwrap();
+        let msg = parse_discord_message(
+            &d2,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &reqwest::Client::new(),
+            "",
+            &ambient,
+        )
+        .await
+        .unwrap();
         assert!(!msg.metadata.contains_key("was_mentioned"));
     }
 
     #[test]
     fn test_discord_adapter_creation() {
-        let adapter = DiscordAdapter::new("test-token".to_string(), vec!["123".to_string(), "456".to_string()], vec![], true, 37376, vec![]);
+        let adapter = DiscordAdapter::new(
+            "test-token".to_string(),
+            vec!["123".to_string(), "456".to_string()],
+            vec![],
+            true,
+            37376,
+            vec![],
+        );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
     }

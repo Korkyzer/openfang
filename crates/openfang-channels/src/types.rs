@@ -257,7 +257,7 @@ pub trait ChannelAdapter: Send + Sync {
         Ok(())
     }
 
-        /// Edit a previously sent message by ID.
+    /// Edit a previously sent message by ID.
     ///
     /// Default: no-op. Override in adapters that support message editing.
     async fn edit_message(

@@ -103,6 +103,18 @@ pub trait ChannelBridgeHandle: Send + Sync {
         Ok(())
     }
 
+    /// Authorize a specific named user for a privileged channel action.
+    async fn authorize_named_channel_user(
+        &self,
+        channel_type: &str,
+        platform_id: &str,
+        _expected_name: &str,
+        action: &str,
+    ) -> Result<(), String> {
+        self.authorize_channel_user(channel_type, platform_id, action)
+            .await
+    }
+
     /// Get per-channel overrides for a given channel type.
     ///
     /// Returns `None` if the channel is not configured or has no overrides.
@@ -195,6 +207,16 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// List discovered external A2A agents.
     async fn a2a_agents_text(&self) -> String {
         "A2A agents not available.".to_string()
+    }
+
+    /// Run host disk cleanup and return a formatted status message.
+    async fn disk_cleanup_text(&self) -> String {
+        "Disk cleanup is not available.".to_string()
+    }
+
+    /// Return current disk status as formatted text.
+    async fn disk_status_text(&self) -> String {
+        "Disk status is not available.".to_string()
     }
 }
 
@@ -408,7 +430,9 @@ async fn dispatch_message(
                 }
                 GroupPolicy::MentionOnly => {
                     // Only allow messages where the bot was @mentioned or commands.
-                    let was_mentioned = message.metadata.get("was_mentioned")
+                    let was_mentioned = message
+                        .metadata
+                        .get("was_mentioned")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let is_command = matches!(&message.content, ChannelContent::Command { .. });
@@ -453,23 +477,39 @@ async fn dispatch_message(
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
-        ChannelContent::Image { ref url, ref caption } => {
+        ChannelContent::Image {
+            ref url,
+            ref caption,
+        } => {
             let desc = match caption {
                 Some(c) => format!("[User sent a photo: {url}]\nCaption: {c}"),
                 None => format!("[User sent a photo: {url}]"),
             };
             desc
         }
-        ChannelContent::File { ref url, ref filename } => {
+        ChannelContent::File {
+            ref url,
+            ref filename,
+        } => {
             format!("[User sent a file ({filename}): {url}]")
         }
-        ChannelContent::Voice { ref url, duration_seconds } => {
+        ChannelContent::Voice {
+            ref url,
+            duration_seconds,
+        } => {
             format!("[User sent a voice message ({duration_seconds}s): {url}]")
         }
         ChannelContent::Location { lat, lon } => {
             format!("[User shared location: {lat}, {lon}]")
         }
     };
+
+    if ct_str == "discord" {
+        if let Some(result) = maybe_handle_discord_disk_command(message, &text, handle).await {
+            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            return;
+        }
+    }
 
     // Check if it's a slash command embedded in text (e.g. "/agents")
     if text.starts_with('/') {
@@ -680,13 +720,19 @@ async fn dispatch_message(
                 if formatted.len() > 1800 {
                     // Response too long for edit -- delete placeholder, send as new message(s)
                     let _ = adapter.delete_message(&message.sender, pid).await;
-                    send_response(adapter, &message.sender, response, thread_id, output_format).await;
+                    send_response(adapter, &message.sender, response, thread_id, output_format)
+                        .await;
                 } else {
                     // Edit placeholder with actual response
                     let content = ChannelContent::Text(formatted);
-                    if let Err(e) = adapter.edit_message(&message.sender, pid, content).await.map_err(|e| e.to_string()) {
+                    if let Err(e) = adapter
+                        .edit_message(&message.sender, pid, content)
+                        .await
+                        .map_err(|e| e.to_string())
+                    {
                         warn!("Failed to edit placeholder: {e}, sending new message");
-                        send_response(adapter, &message.sender, response, thread_id, output_format).await;
+                        send_response(adapter, &message.sender, response, thread_id, output_format)
+                            .await;
                     }
                 }
             } else {
@@ -723,6 +769,44 @@ async fn dispatch_message(
                 .await;
         }
     }
+}
+
+async fn maybe_handle_discord_disk_command(
+    message: &ChannelMessage,
+    text: &str,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+) -> Option<String> {
+    let (command, _) = parse_prefixed_command(text, '!')?;
+    if !matches!(command, "cleanup" | "disk") {
+        return None;
+    }
+
+    let sender_id = message
+        .metadata
+        .get("sender_id")
+        .and_then(|value| value.as_str())?;
+
+    if let Err(denied) = handle
+        .authorize_named_channel_user("discord", sender_id, "asa", "disk")
+        .await
+    {
+        return Some(format!("Access denied: {denied}"));
+    }
+
+    Some(match command {
+        "cleanup" => handle.disk_cleanup_text().await,
+        "disk" => handle.disk_status_text().await,
+        _ => unreachable!(),
+    })
+}
+
+fn parse_prefixed_command(text: &str, prefix: char) -> Option<(&str, Vec<String>)> {
+    let trimmed = text.trim();
+    let command_text = trimmed.strip_prefix(prefix)?;
+    let mut parts = command_text.split_whitespace();
+    let name = parts.next()?;
+    let args = parts.map(String::from).collect();
+    Some((name, args))
 }
 
 /// Handle a bot command (returns the response text).

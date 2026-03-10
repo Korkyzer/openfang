@@ -55,7 +55,13 @@ pub trait KernelHandle: Send + Sync {
         agent_id: Option<&str>,
         limit: u32,
         requester_agent_id: Option<&str>,
-    ) -> Result<(Option<String>, Vec<openfang_memory::session::SessionSearchResult>), String>;
+    ) -> Result<
+        (
+            Option<String>,
+            Vec<openfang_memory::session::SessionSearchResult>,
+        ),
+        String,
+    >;
 
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;

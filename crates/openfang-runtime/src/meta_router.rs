@@ -76,7 +76,10 @@ pub async fn query_meta_router(
         }
         Err(e) => {
             if e.is_timeout() {
-                warn!("Meta-router timed out ({}ms limit)", META_ROUTER_TIMEOUT.as_millis());
+                warn!(
+                    "Meta-router timed out ({}ms limit)",
+                    META_ROUTER_TIMEOUT.as_millis()
+                );
             } else if e.is_connect() {
                 debug!("Meta-router not reachable — using local routing");
             } else {
