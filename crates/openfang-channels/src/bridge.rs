@@ -219,6 +219,27 @@ pub trait ChannelBridgeHandle: Send + Sync {
         "Disk status is not available.".to_string()
     }
 
+
+    /// Run the host heartbeat status command and return the output.
+    async fn heartbeat_status_text(&self) -> String {
+        "Heartbeat status is not available.".to_string()
+    }
+
+    /// Pause every running agent.
+    async fn pause_all_agents_text(&self) -> String {
+        "Pause is not available.".to_string()
+    }
+
+    /// Resume every suspended agent.
+    async fn resume_all_agents_text(&self) -> String {
+        "Resume is not available.".to_string()
+    }
+
+    /// Schedule a daemon shutdown after posting confirmation to the channel.
+    async fn shutdown_service_text(&self) -> String {
+        "Shutting down...".to_string()
+    }
+
     /// Send a message while optionally streaming phase updates.
     ///
     /// Implementations that do not support phase updates can ignore `phase_tx`
@@ -519,7 +540,7 @@ async fn dispatch_message(
     };
 
     if ct_str == "discord" {
-        if let Some(result) = maybe_handle_discord_disk_command(message, &text, handle).await {
+        if let Some(result) = maybe_handle_discord_admin_command(message, &text, handle).await {
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
@@ -785,31 +806,35 @@ async fn dispatch_message(
     }
 }
 
-async fn maybe_handle_discord_disk_command(
+async fn maybe_handle_discord_admin_command(
     message: &ChannelMessage,
     text: &str,
     handle: &Arc<dyn ChannelBridgeHandle>,
 ) -> Option<String> {
     let (command, _) = parse_prefixed_command(text, '!')?;
-    if !matches!(command, "cleanup" | "disk") {
+    if !matches!(
+        command,
+        "status" | "pause" | "resume" | "stop-llm" | "start-llm" | "cleanup" | "disk" | "kill"
+    ) {
         return None;
     }
 
-    let sender_id = message
+    let sender_username = message
         .metadata
-        .get("sender_id")
+        .get("sender_username")
         .and_then(|value| value.as_str())?;
-
-    if let Err(denied) = handle
-        .authorize_named_channel_user("discord", sender_id, "asa", "disk")
-        .await
-    {
-        return Some(format!("Access denied: {denied}"));
+    if sender_username != "Asa" {
+        return None;
     }
 
     Some(match command {
+        "status" => handle.heartbeat_status_text().await,
+        "pause" => handle.pause_all_agents_text().await,
+        "resume" => handle.resume_all_agents_text().await,
+        "stop-llm" | "start-llm" => "not implemented".to_string(),
         "cleanup" => handle.disk_cleanup_text().await,
         "disk" => handle.disk_status_text().await,
+        "kill" => handle.shutdown_service_text().await,
         _ => unreachable!(),
     })
 }

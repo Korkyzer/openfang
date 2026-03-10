@@ -63,8 +63,10 @@ pub struct KernelBridgeAdapter {
     started_at: Instant,
 }
 
+const HEARTBEAT_SCRIPT: &str = "/root/openfang-tools/heartbeat.sh";
 const DISK_CLEANUP_SCRIPT: &str = "/root/openfang-tools/cleanup.sh";
-const DISK_STATUS_CMD: &str = r#"df -h / | awk 'NR==2 {print $5" ("$3"/"$2", "$4" free)"}'"#;
+const DISK_STATUS_CMD: &str = "df -h /";
+const ADMIN_API_BASE_URL: &str = "http://100.114.38.21:4200";
 
 #[derive(Debug, Default)]
 struct CleanupSummary {
@@ -126,6 +128,51 @@ async fn run_command_capture(mut command: Command) -> Result<String, String> {
         Err(stdout)
     } else {
         Err(format!("command exited with status {}", output.status))
+    }
+}
+
+
+fn read_admin_api_token(home_dir: &std::path::Path, fallback: &str) -> String {
+    let config_path = home_dir.join("config.toml");
+    match std::fs::read_to_string(config_path) {
+        Ok(contents) => contents
+            .lines()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                if !trimmed.starts_with("api_key") {
+                    return None;
+                }
+                trimmed
+                    .split_once('=')
+                    .map(|(_, value)| value.trim().trim_matches('"').to_string())
+            })
+            .filter(|token| !token.is_empty())
+            .unwrap_or_else(|| fallback.to_string()),
+        Err(_) => fallback.to_string(),
+    }
+}
+
+async fn post_admin_api(
+    client: &reqwest::Client,
+    home_dir: &std::path::Path,
+    fallback_token: &str,
+    route: &str,
+) -> Result<String, String> {
+    let token = read_admin_api_token(home_dir, fallback_token);
+    let response = client
+        .post(format!("{ADMIN_API_BASE_URL}{route}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(body)
+    } else if body.is_empty() {
+        Err(format!("HTTP {status}"))
+    } else {
+        Err(format!("HTTP {status}: {body}"))
     }
 }
 
@@ -916,6 +963,57 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             Ok(_) => "Disk status unavailable.".to_string(),
             Err(e) => format!("Disk status failed: {e}"),
         }
+    }
+
+
+    async fn heartbeat_status_text(&self) -> String {
+        let mut command = Command::new("bash");
+        command.arg(HEARTBEAT_SCRIPT);
+        match run_command_capture(command).await {
+            Ok(output) if !output.is_empty() => output,
+            Ok(_) => "Heartbeat script returned no output.".to_string(),
+            Err(e) => format!("Heartbeat status failed: {e}"),
+        }
+    }
+
+    async fn pause_all_agents_text(&self) -> String {
+        let client = reqwest::Client::new();
+        match post_admin_api(
+            &client,
+            &self.kernel.config.home_dir,
+            &self.kernel.config.api_key,
+            "/api/agents/pause-all",
+        )
+        .await
+        {
+            Ok(_) => "Paused all agents.".to_string(),
+            Err(e) => format!("Pause failed: {e}"),
+        }
+    }
+
+    async fn resume_all_agents_text(&self) -> String {
+        let client = reqwest::Client::new();
+        match post_admin_api(
+            &client,
+            &self.kernel.config.home_dir,
+            &self.kernel.config.api_key,
+            "/api/agents/resume-all",
+        )
+        .await
+        {
+            Ok(_) => "Resumed all agents.".to_string(),
+            Err(e) => format!("Resume failed: {e}"),
+        }
+    }
+
+    async fn shutdown_service_text(&self) -> String {
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut command = Command::new("sh");
+            command.args(["-lc", "systemctl stop openfang"]);
+            let _ = command.output().await;
+        });
+        "Shutting down...".to_string()
     }
 
     async fn record_delivery(

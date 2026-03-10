@@ -16,6 +16,18 @@ use tracing::{debug, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
+const WORKSPACE_FILE_ALLOWLIST: &[&str] = &[
+    "SOUL.md",
+    "MEMORY.md",
+    "GOALS.md",
+    "IDENTITY.md",
+    "BOOTSTRAP.md",
+    "USER.md",
+    "AGENTS.md",
+];
+const WORKSPACE_WRITE_MAX_CHARS: usize = 10_000;
+const DEFAULT_GIT_LOG_LIMIT: u64 = 10;
+const GIT_REPO_ALLOWLIST: &[&str] = &["/root/openfang-main"];
 
 /// Check if a shell command should be blocked by taint tracking.
 ///
@@ -171,6 +183,8 @@ pub async fn execute_tool(
         "file_read" => tool_file_read(input, workspace_root).await,
         "file_write" => tool_file_write(input, workspace_root).await,
         "file_list" => tool_file_list(input, workspace_root).await,
+        "workspace_read" => tool_workspace_read(input, workspace_root).await,
+        "workspace_write" => tool_workspace_write(input, workspace_root).await,
         "apply_patch" => tool_apply_patch(input, workspace_root).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
@@ -267,6 +281,8 @@ pub async fn execute_tool(
             )
             .await
         }
+        "git_log" => tool_git_log(input).await,
+        "git_summary" => tool_git_summary(input).await,
 
         // Inter-agent tools (require kernel handle)
         "agent_send" => tool_agent_send(input, kernel).await,
@@ -563,6 +579,29 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "workspace_read".to_string(),
+            description: "Read one of the agent workspace identity files (SOUL.md, MEMORY.md, GOALS.md, IDENTITY.md, BOOTSTRAP.md, USER.md, AGENTS.md). Returns an empty string when the file does not exist.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "description": "Allowed values: SOUL.md, MEMORY.md, GOALS.md, IDENTITY.md, BOOTSTRAP.md, USER.md, AGENTS.md" }
+                },
+                "required": ["filename"]
+            }),
+        },
+        ToolDefinition {
+            name: "workspace_write".to_string(),
+            description: "Overwrite one of the agent workspace identity files. Content is silently truncated to 10000 characters.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "description": "Allowed values: SOUL.md, MEMORY.md, GOALS.md, IDENTITY.md, BOOTSTRAP.md, USER.md, AGENTS.md" },
+                    "content": { "type": "string", "description": "File content to write (max 10000 chars after truncation)" }
+                },
+                "required": ["filename", "content"]
+            }),
+        },
+        ToolDefinition {
             name: "apply_patch".to_string(),
             description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
             input_schema: serde_json::json!({
@@ -614,6 +653,29 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "timeout_seconds": { "type": "integer", "description": "Timeout in seconds (default: 30)" }
                 },
                 "required": ["command"]
+            }),
+        },
+        ToolDefinition {
+            name: "git_log".to_string(),
+            description: "Return the 10 latest commit lines from an allowlisted Git repository.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": { "type": "string", "description": "Allowlisted absolute repository path" },
+                    "limit": { "type": "integer", "description": "Maximum number of commits to return (default: 10)" }
+                },
+                "required": ["repo_path"]
+            }),
+        },
+        ToolDefinition {
+            name: "git_summary".to_string(),
+            description: "Return git status plus the last 5 commits from an allowlisted repository.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": { "type": "string", "description": "Allowlisted absolute repository path" }
+                },
+                "required": ["repo_path"]
             }),
         },
         // --- Inter-agent tools ---
@@ -1283,6 +1345,66 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
     }
 }
 
+
+fn validate_workspace_filename(filename: &str) -> Result<&str, String> {
+    if WORKSPACE_FILE_ALLOWLIST.contains(&filename) {
+        Ok(filename)
+    } else {
+        Err(format!(
+            "Filename '{filename}' is not allowed. Allowed files: {}",
+            WORKSPACE_FILE_ALLOWLIST.join(", ")
+        ))
+    }
+}
+
+fn resolve_workspace_identity_path(
+    filename: &str,
+    workspace_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let filename = validate_workspace_filename(filename)?;
+    let root = workspace_root.ok_or(
+        "workspace_read/workspace_write require an agent workspace; workspace_root was missing",
+    )?;
+    Ok(root.join(filename))
+}
+
+fn truncate_to_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        input.to_string()
+    } else {
+        input.chars().take(max_chars).collect()
+    }
+}
+
+fn validate_git_repo_path(repo_path: &str) -> Result<PathBuf, String> {
+    if !GIT_REPO_ALLOWLIST.contains(&repo_path) {
+        return Err(format!(
+            "Repository '{repo_path}' is not allowed. Allowed repositories: {}",
+            GIT_REPO_ALLOWLIST.join(", ")
+        ));
+    }
+    let repo = PathBuf::from(repo_path);
+    if !repo.join(".git").exists() {
+        return Err(format!("Repository '{repo_path}' does not look like a Git repository"));
+    }
+    Ok(repo)
+}
+
+async fn run_git_command(repo: &Path, args: &[String]) -> Result<String, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git command: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
@@ -1343,6 +1465,50 @@ async fn tool_file_list(
     }
     files.sort();
     Ok(files.join("\n"))
+}
+
+
+async fn tool_workspace_read(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let filename = input["filename"]
+        .as_str()
+        .ok_or("Missing 'filename' parameter")?;
+    let path = resolve_workspace_identity_path(filename, workspace_root)?;
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(format!("Failed to read workspace file: {err}")),
+    }
+}
+
+async fn tool_workspace_write(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let filename = input["filename"]
+        .as_str()
+        .ok_or("Missing 'filename' parameter")?;
+    let path = resolve_workspace_identity_path(filename, workspace_root)?;
+    let content = input["content"]
+        .as_str()
+        .ok_or("Missing 'content' parameter")?;
+    let truncated = truncate_to_chars(content, WORKSPACE_WRITE_MAX_CHARS);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create workspace directories: {e}"))?;
+    }
+    tokio::fs::write(&path, truncated.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to write workspace file: {e}"))?;
+    serde_json::to_string(&serde_json::json!({
+        "status": "written",
+        "path": path.to_string_lossy(),
+        "bytes": truncated.as_bytes().len(),
+    }))
+    .map_err(|e| format!("Failed to serialize workspace_write response: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,6 +1751,36 @@ async fn tool_shell_exec(
         Ok(Err(e)) => Err(format!("Failed to execute command: {e}")),
         Err(_) => Err(format!("Command timed out after {timeout_secs}s")),
     }
+}
+
+
+async fn tool_git_log(input: &serde_json::Value) -> Result<String, String> {
+    let repo_path = input["repo_path"]
+        .as_str()
+        .ok_or("Missing 'repo_path' parameter")?;
+    let limit = input["limit"]
+        .as_u64()
+        .unwrap_or(DEFAULT_GIT_LOG_LIMIT)
+        .clamp(1, 50);
+    let repo = validate_git_repo_path(repo_path)?;
+    run_git_command(&repo, &["log".to_string(), "--oneline".to_string(), format!("-{limit}")])
+        .await
+}
+
+async fn tool_git_summary(input: &serde_json::Value) -> Result<String, String> {
+    let repo_path = input["repo_path"]
+        .as_str()
+        .ok_or("Missing 'repo_path' parameter")?;
+    let repo = validate_git_repo_path(repo_path)?;
+    let status = run_git_command(&repo, &["status".to_string(), "--short".to_string(), "--branch".to_string()]).await?;
+    let log = run_git_command(
+        &repo,
+        &["log".to_string(), "--oneline".to_string(), "-5".to_string()],
+    )
+    .await?;
+    Ok(format!("{status}
+
+{log}"))
 }
 
 // ---------------------------------------------------------------------------

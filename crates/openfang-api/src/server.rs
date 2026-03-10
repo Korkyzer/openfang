@@ -125,6 +125,14 @@ pub async fn build_router(
             axum::routing::get(routes::list_agents).post(routes::spawn_agent),
         )
         .route(
+            "/api/agents/pause-all",
+            axum::routing::post(routes::pause_all_agents),
+        )
+        .route(
+            "/api/agents/resume-all",
+            axum::routing::post(routes::resume_all_agents),
+        )
+        .route(
             "/api/agents/{id}",
             axum::routing::get(routes::get_agent)
                 .delete(routes::kill_agent)
@@ -537,6 +545,14 @@ pub async fn build_router(
         .route(
             "/api/cron/jobs",
             axum::routing::get(routes::list_cron_jobs).post(routes::create_cron_job),
+        )
+        .route(
+            "/v1/cron/jobs",
+            axum::routing::get(routes::v1_list_cron_jobs).post(routes::v1_create_cron_job),
+        )
+        .route(
+            "/v1/cron/jobs/{id}",
+            axum::routing::delete(routes::v1_delete_cron_job),
         )
         .route(
             "/api/cron/jobs/{id}",

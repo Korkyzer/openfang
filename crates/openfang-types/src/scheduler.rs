@@ -5,7 +5,7 @@
 
 use crate::agent::AgentId;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 /// Maximum number of scheduled jobs per agent.
@@ -78,7 +78,7 @@ impl std::str::FromStr for CronJobId {
 // ---------------------------------------------------------------------------
 
 /// When a scheduled job fires.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronSchedule {
     /// Fire once at a specific time.
@@ -98,6 +98,46 @@ pub enum CronSchedule {
         /// Optional IANA timezone (e.g. `"America/New_York"`). Defaults to UTC.
         tz: Option<String>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CronScheduleTagged {
+    At { at: DateTime<Utc> },
+    Every { every_secs: u64 },
+    Cron { expr: String, tz: Option<String> },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CronScheduleWire {
+    Tagged(CronScheduleTagged),
+    String(String),
+}
+
+impl<'de> Deserialize<'de> for CronSchedule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match CronScheduleWire::deserialize(deserializer)? {
+            CronScheduleWire::Tagged(tagged) => Ok(match tagged {
+                CronScheduleTagged::At { at } => Self::At { at },
+                CronScheduleTagged::Every { every_secs } => Self::Every { every_secs },
+                CronScheduleTagged::Cron { expr, tz } => Self::Cron { expr, tz },
+            }),
+            CronScheduleWire::String(expr) => {
+                let expr = expr.trim();
+                if expr.is_empty() {
+                    return Err(de::Error::custom("cron schedule string must not be empty"));
+                }
+                Ok(Self::Cron {
+                    expr: expr.to_string(),
+                    tz: None,
+                })
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +851,18 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn serde_accepts_simple_cron_schedule_string() {
+        let back: CronSchedule = serde_json::from_str(""* * * * *"").unwrap();
+        match back {
+            CronSchedule::Cron { expr, tz } => {
+                assert_eq!(expr, "* * * * *");
+                assert_eq!(tz, None);
+            }
+            _ => panic!("expected Cron variant"),
+        }
+    }
     #[test]
     fn serde_action_tags() {
         let action = CronAction::AgentTurn {

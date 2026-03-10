@@ -228,6 +228,66 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
 }
 
 /// Resolve uploaded file attachments into ContentBlock::Image blocks.
+
+/// POST /api/agents/pause-all — Suspend all active agents.
+pub async fn pause_all_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.kernel.pause_all_agents() {
+        Ok(paused) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "paused", "paused_agents": paused})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// POST /api/agents/resume-all — Resume every suspended agent.
+pub async fn resume_all_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.kernel.resume_all_agents() {
+        Ok(resumed) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "running", "resumed_agents": resumed})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+
+#[derive(serde::Deserialize)]
+pub struct V1CreateCronJobRequest {
+    name: String,
+    agent_id: String,
+    prompt: String,
+    schedule: openfang_types::scheduler::CronSchedule,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn resolve_agent_id_or_name(
+    state: &Arc<AppState>,
+    agent_id: &str,
+) -> Result<AgentId, (StatusCode, Json<serde_json::Value>)> {
+    if let Ok(agent_id) = agent_id.parse::<AgentId>() {
+        return Ok(agent_id);
+    }
+    if let Some(entry) = state.kernel.registry.find_by_name(agent_id) {
+        return Ok(entry.id);
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": format!("Unknown agent '{}'", agent_id)})),
+    ))
+}
+
 ///
 /// Reads each file from the upload directory, base64-encodes it, and
 /// returns image content blocks ready to insert into a session message.
@@ -9497,6 +9557,107 @@ pub async fn create_cron_job(
 }
 
 /// DELETE /api/cron/jobs/{id} — Delete a cron job.
+
+/// GET /v1/cron/jobs — List cron jobs in the compatibility format.
+pub async fn v1_list_cron_jobs(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let jobs = if let Some(agent_ref) = params.get("agent_id") {
+        match resolve_agent_id_or_name(&state, agent_ref) {
+            Ok(agent_id) => state.kernel.cron_scheduler.list_jobs(agent_id),
+            Err(err) => return err,
+        }
+    } else {
+        state.kernel.cron_scheduler.list_all_jobs()
+    };
+    let total = jobs.len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"jobs": jobs, "total": total})),
+    )
+}
+
+/// POST /v1/cron/jobs — Create a cron job using the simplified payload.
+pub async fn v1_create_cron_job(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<V1CreateCronJobRequest>,
+) -> impl IntoResponse {
+    let agent_id = match resolve_agent_id_or_name(&state, &body.agent_id) {
+        Ok(agent_id) => agent_id,
+        Err(err) => return err,
+    };
+
+    let job = openfang_types::scheduler::CronJob {
+        id: openfang_types::scheduler::CronJobId::new(),
+        agent_id,
+        name: body.name,
+        enabled: true,
+        schedule: body.schedule,
+        action: openfang_types::scheduler::CronAction::AgentTurn {
+            message: body.prompt,
+            model_override: None,
+            timeout_secs: None,
+        },
+        delivery: openfang_types::scheduler::CronDelivery::None,
+        created_at: chrono::Utc::now(),
+        last_run: None,
+        next_run: None,
+    };
+    let one_shot = matches!(job.schedule, openfang_types::scheduler::CronSchedule::At { .. });
+
+    match state.kernel.cron_scheduler.add_job(job.clone(), one_shot) {
+        Ok(job_id) => {
+            if !body.enabled {
+                let _ = state.kernel.cron_scheduler.set_enabled(job_id, false);
+            }
+            let _ = state.kernel.cron_scheduler.persist();
+            let job = state
+                .kernel
+                .cron_scheduler
+                .get_job(job_id)
+                .unwrap_or(job);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({"job": job})),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// DELETE /v1/cron/jobs/{id} — Delete a cron job.
+pub async fn v1_delete_cron_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match uuid::Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let job_id = openfang_types::scheduler::CronJobId(uuid);
+            match state.kernel.cron_scheduler.remove_job(job_id) {
+                Ok(_) => {
+                    let _ = state.kernel.cron_scheduler.persist();
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"status": "deleted", "id": id})),
+                    )
+                }
+                Err(e) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("{e}")})),
+                ),
+            }
+        }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid job ID"})),
+        ),
+    }
+}
+
 pub async fn delete_cron_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

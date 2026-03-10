@@ -307,17 +307,6 @@ pub trait ChannelAdapter: Send + Sync {
         self.send(user, content).await?;
         Ok(String::new())
     }
-
-    /// Edit an existing message in-place by its platform message ID.
-    /// Default: no-op (most adapters do not support message editing).
-    async fn edit_message(
-        &self,
-        _user: &ChannelUser,
-        _message_id: &str,
-        _content: ChannelContent,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(())
-    }
 }
 
 /// Split a message into chunks of at most `max_len` characters,

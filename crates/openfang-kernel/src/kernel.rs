@@ -1332,6 +1332,53 @@ impl OpenFangKernel {
         Ok(agent_id)
     }
 
+
+    /// Resolve an agent by UUID string or by its registered name.
+    pub fn resolve_agent_reference(&self, agent: &str) -> KernelResult<AgentId> {
+        if let Ok(id) = agent.parse::<AgentId>() {
+            return Ok(id);
+        }
+        self.registry
+            .find_by_name(agent)
+            .map(|entry| entry.id)
+            .ok_or_else(|| KernelError::OpenFang(OpenFangError::AgentNotFound(agent.to_string())))
+    }
+
+    /// Suspend all non-terminated agents and persist the updated state.
+    pub fn pause_all_agents(&self) -> KernelResult<usize> {
+        let mut paused = 0usize;
+        for entry in self.registry.list() {
+            if matches!(entry.state, AgentState::Terminated | AgentState::Suspended) {
+                continue;
+            }
+            self.registry
+                .set_state(entry.id, AgentState::Suspended)
+                .map_err(KernelError::OpenFang)?;
+            if let Some(updated) = self.registry.get(entry.id) {
+                self.memory.save_agent(&updated).map_err(KernelError::OpenFang)?;
+            }
+            paused += 1;
+        }
+        Ok(paused)
+    }
+
+    /// Resume all suspended agents and persist the updated state.
+    pub fn resume_all_agents(&self) -> KernelResult<usize> {
+        let mut resumed = 0usize;
+        for entry in self.registry.list() {
+            if entry.state != AgentState::Suspended {
+                continue;
+            }
+            self.registry
+                .set_state(entry.id, AgentState::Running)
+                .map_err(KernelError::OpenFang)?;
+            if let Some(updated) = self.registry.get(entry.id) {
+                self.memory.save_agent(&updated).map_err(KernelError::OpenFang)?;
+            }
+            resumed += 1;
+        }
+        Ok(resumed)
+    }
     /// Verify a signed manifest envelope (Ed25519 + SHA-256).
     ///
     /// Call this before `spawn_agent` when a `SignedManifest` JSON is provided
@@ -1386,6 +1433,11 @@ impl OpenFangKernel {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        if entry.state == AgentState::Suspended {
+            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(
+                format!("Agent {} is paused", entry.name),
+            )));
+        }
 
         // Dispatch based on module type
         let result = if entry.manifest.module.starts_with("wasm:") {
@@ -1462,6 +1514,11 @@ impl OpenFangKernel {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        if entry.state == AgentState::Suspended {
+            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(
+                format!("Agent {} is paused", entry.name),
+            )));
+        }
 
         let is_wasm = entry.manifest.module.starts_with("wasm:");
         let is_python = entry.manifest.module.starts_with("python:");
