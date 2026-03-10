@@ -148,17 +148,26 @@ pub async fn agent_ws(
     // SECURITY: Authenticate WebSocket upgrades (bypasses middleware).
     let api_key = &state.kernel.config.api_key;
     if !api_key.is_empty() {
+        // SECURITY: Use constant-time comparison to prevent timing attacks on API key
+        let ct_eq = |token: &str, key: &str| -> bool {
+            use subtle::ConstantTimeEq;
+            if token.len() != key.len() {
+                return false;
+            }
+            token.as_bytes().ct_eq(key.as_bytes()).into()
+        };
+
         let header_auth = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|token| token == api_key)
+            .map(|token| ct_eq(token, api_key))
             .unwrap_or(false);
 
         let query_auth = uri
             .query()
             .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .map(|token| token == api_key)
+            .map(|token| ct_eq(token, api_key))
             .unwrap_or(false);
 
         if !header_auth && !query_auth {
@@ -801,7 +810,10 @@ async fn handle_command(
                 match state.kernel.set_agent_model(agent_id, args) {
                     Ok(()) => {
                         let msg = if let Some(entry) = state.kernel.registry.get(agent_id) {
-                            format!("Model switched to: {} (provider: {})", entry.manifest.model.model, entry.manifest.model.provider)
+                            format!(
+                                "Model switched to: {} (provider: {})",
+                                entry.manifest.model.model, entry.manifest.model.provider
+                            )
                         } else {
                             format!("Model switched to: {args}")
                         };
@@ -1121,11 +1133,13 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
             if inner.contains("localhost:11434") || inner.contains("ollama") {
                 "Model not found on Ollama. Run `ollama pull <model>` to download it, then try again. Use /model to see options.".to_string()
             } else {
-                "Model unavailable. Use /model to see options or check your provider configuration.".to_string()
+                "Model unavailable. Use /model to see options or check your provider configuration."
+                    .to_string()
             }
         }
         llm_errors::LlmErrorCategory::Format => {
-            "LLM request failed. Check your API key and model configuration in Settings.".to_string()
+            "LLM request failed. Check your API key and model configuration in Settings."
+                .to_string()
         }
         _ => classified.sanitized_message,
     }

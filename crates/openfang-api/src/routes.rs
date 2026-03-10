@@ -43,9 +43,53 @@ pub async fn spawn_agent(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SpawnRequest>,
 ) -> impl IntoResponse {
+    // Resolve template name → manifest_toml if template is provided and manifest_toml is empty
+    let manifest_toml = if req.manifest_toml.trim().is_empty() {
+        if let Some(ref tmpl_name) = req.template {
+            // Sanitize template name to prevent path traversal
+            let safe_name = tmpl_name
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect::<String>();
+            if safe_name.is_empty() || safe_name != *tmpl_name {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid template name"})),
+                );
+            }
+            let tmpl_path = state
+                .kernel
+                .config
+                .home_dir
+                .join("agents")
+                .join(&safe_name)
+                .join("agent.toml");
+            match std::fs::read_to_string(&tmpl_path) {
+                Ok(content) => content,
+                Err(_) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(
+                            serde_json::json!({"error": format!("Template '{}' not found", safe_name)}),
+                        ),
+                    );
+                }
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": "Either 'manifest_toml' or 'template' is required"}),
+                ),
+            );
+        }
+    } else {
+        req.manifest_toml.clone()
+    };
+
     // SECURITY: Reject oversized manifests to prevent parser memory exhaustion.
     const MAX_MANIFEST_SIZE: usize = 1024 * 1024; // 1MB
-    if req.manifest_toml.len() > MAX_MANIFEST_SIZE {
+    if manifest_toml.len() > MAX_MANIFEST_SIZE {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({"error": "Manifest too large (max 1MB)"})),
@@ -57,7 +101,7 @@ pub async fn spawn_agent(
         match state.kernel.verify_signed_manifest(signed_json) {
             Ok(verified_toml) => {
                 // Ensure the signed manifest matches the provided manifest_toml
-                if verified_toml.trim() != req.manifest_toml.trim() {
+                if verified_toml.trim() != manifest_toml.trim() {
                     tracing::warn!("Signed manifest content does not match manifest_toml");
                     return (
                         StatusCode::BAD_REQUEST,
@@ -83,7 +127,7 @@ pub async fn spawn_agent(
         }
     }
 
-    let manifest: AgentManifest = match toml::from_str(&req.manifest_toml) {
+    let manifest: AgentManifest = match toml::from_str(&manifest_toml) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("Invalid manifest TOML: {e}");
@@ -126,15 +170,13 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .into_iter()
         .map(|e| {
             // Resolve "default" provider/model to actual kernel defaults
-            let provider = if e.manifest.model.provider.is_empty()
-                || e.manifest.model.provider == "default"
-            {
-                dm.provider.as_str()
-            } else {
-                e.manifest.model.provider.as_str()
-            };
-            let model = if e.manifest.model.model.is_empty()
-                || e.manifest.model.model == "default"
+            let provider =
+                if e.manifest.model.provider.is_empty() || e.manifest.model.provider == "default" {
+                    dm.provider.as_str()
+                } else {
+                    e.manifest.model.provider.as_str()
+                };
+            let model = if e.manifest.model.model.is_empty() || e.manifest.model.model == "default"
             {
                 dm.model.as_str()
             } else {
@@ -390,68 +432,138 @@ pub async fn get_agent_session(
 
     match state.kernel.memory.get_session(entry.session_id) {
         Ok(Some(session)) => {
-            let messages: Vec<serde_json::Value> = session
-                .messages
-                .iter()
-                .filter_map(|m| {
-                    let mut tools: Vec<serde_json::Value> = Vec::new();
-                    let content = match &m.content {
-                        openfang_types::message::MessageContent::Text(t) => t.clone(),
-                        openfang_types::message::MessageContent::Blocks(blocks) => {
-                            // Extract human-readable text and tool info from blocks
-                            let mut texts = Vec::new();
-                            for b in blocks {
-                                match b {
-                                    openfang_types::message::ContentBlock::Text { text } => {
-                                        texts.push(text.clone());
-                                    }
-                                    openfang_types::message::ContentBlock::Image { .. } => {
-                                        texts.push("[Image]".to_string());
-                                    }
-                                    openfang_types::message::ContentBlock::ToolUse {
-                                        name, ..
-                                    } => {
-                                        tools.push(serde_json::json!({
-                                            "name": name,
-                                            "running": false,
-                                            "expanded": false,
+            // Two-pass approach: ToolUse blocks live in Assistant messages while
+            // ToolResult blocks arrive in subsequent User messages.  Pass 1
+            // collects all tool_use entries keyed by id; pass 2 attaches results.
+
+            // Pass 1: build messages and a lookup from tool_use_id → (msg_idx, tool_idx)
+            use base64::Engine as _;
+            let mut built_messages: Vec<serde_json::Value> = Vec::new();
+            let mut tool_use_index: std::collections::HashMap<String, (usize, usize)> =
+                std::collections::HashMap::new();
+
+            for m in &session.messages {
+                let mut tools: Vec<serde_json::Value> = Vec::new();
+                let mut msg_images: Vec<serde_json::Value> = Vec::new();
+                let content = match &m.content {
+                    openfang_types::message::MessageContent::Text(t) => t.clone(),
+                    openfang_types::message::MessageContent::Blocks(blocks) => {
+                        let mut texts = Vec::new();
+                        for b in blocks {
+                            match b {
+                                openfang_types::message::ContentBlock::Text { text } => {
+                                    texts.push(text.clone());
+                                }
+                                openfang_types::message::ContentBlock::Image {
+                                    media_type,
+                                    data,
+                                } => {
+                                    texts.push("[Image]".to_string());
+                                    // Persist image to upload dir so it can be
+                                    // served back when loading session history.
+                                    let file_id = uuid::Uuid::new_v4().to_string();
+                                    let upload_dir = std::env::temp_dir().join("openfang_uploads");
+                                    let _ = std::fs::create_dir_all(&upload_dir);
+                                    if let Ok(bytes) =
+                                        base64::engine::general_purpose::STANDARD.decode(data)
+                                    {
+                                        let _ = std::fs::write(upload_dir.join(&file_id), &bytes);
+                                        UPLOAD_REGISTRY.insert(
+                                            file_id.clone(),
+                                            UploadMeta {
+                                                filename: format!(
+                                                    "image.{}",
+                                                    media_type.rsplit('/').next().unwrap_or("png")
+                                                ),
+                                                content_type: media_type.clone(),
+                                            },
+                                        );
+                                        msg_images.push(serde_json::json!({
+                                            "file_id": file_id,
+                                            "filename": format!("image.{}", media_type.rsplit('/').next().unwrap_or("png")),
                                         }));
                                     }
-                                    openfang_types::message::ContentBlock::ToolResult {
-                                        content: result,
-                                        is_error,
-                                        ..
-                                    } => {
-                                        // Attach result to the most recent tool without a result
-                                        if let Some(last_tool) = tools.last_mut() {
+                                }
+                                openfang_types::message::ContentBlock::ToolUse {
+                                    id,
+                                    name,
+                                    input,
+                                    ..
+                                } => {
+                                    let tool_idx = tools.len();
+                                    tools.push(serde_json::json!({
+                                        "name": name,
+                                        "input": input,
+                                        "running": false,
+                                        "expanded": false,
+                                    }));
+                                    // Will be filled after this loop when we know msg_idx
+                                    tool_use_index.insert(id.clone(), (usize::MAX, tool_idx));
+                                }
+                                // ToolResult blocks are handled in pass 2
+                                openfang_types::message::ContentBlock::ToolResult { .. } => {}
+                                _ => {}
+                            }
+                        }
+                        texts.join("\n")
+                    }
+                };
+                // Skip messages that are purely tool results (User role with only ToolResult blocks)
+                if content.is_empty() && tools.is_empty() {
+                    continue;
+                }
+                let msg_idx = built_messages.len();
+                // Fix up the msg_idx for tool_use entries registered with sentinel
+                for (_, (mi, _)) in tool_use_index.iter_mut() {
+                    if *mi == usize::MAX {
+                        *mi = msg_idx;
+                    }
+                }
+                let mut msg = serde_json::json!({
+                    "role": format!("{:?}", m.role),
+                    "content": content,
+                });
+                if !tools.is_empty() {
+                    msg["tools"] = serde_json::Value::Array(tools);
+                }
+                if !msg_images.is_empty() {
+                    msg["images"] = serde_json::Value::Array(msg_images);
+                }
+                built_messages.push(msg);
+            }
+
+            // Pass 2: walk messages again and attach ToolResult to the correct tool
+            for m in &session.messages {
+                if let openfang_types::message::MessageContent::Blocks(blocks) = &m.content {
+                    for b in blocks {
+                        if let openfang_types::message::ContentBlock::ToolResult {
+                            tool_use_id,
+                            content: result,
+                            is_error,
+                            ..
+                        } = b
+                        {
+                            if let Some(&(msg_idx, tool_idx)) = tool_use_index.get(tool_use_id) {
+                                if let Some(msg) = built_messages.get_mut(msg_idx) {
+                                    if let Some(tools_arr) =
+                                        msg.get_mut("tools").and_then(|v| v.as_array_mut())
+                                    {
+                                        if let Some(tool_obj) = tools_arr.get_mut(tool_idx) {
                                             let preview: String =
-                                                result.chars().take(300).collect();
-                                            last_tool["result"] =
-                                                serde_json::Value::String(preview);
-                                            last_tool["is_error"] =
+                                                result.chars().take(2000).collect();
+                                            tool_obj["result"] = serde_json::Value::String(preview);
+                                            tool_obj["is_error"] =
                                                 serde_json::Value::Bool(*is_error);
                                         }
                                     }
-                                    _ => {}
                                 }
                             }
-                            texts.join("\n")
                         }
-                    };
-                    // Skip messages that are purely tool results (User role with only ToolResult blocks)
-                    if content.is_empty() && tools.is_empty() {
-                        return None;
                     }
-                    let mut msg = serde_json::json!({
-                        "role": format!("{:?}", m.role),
-                        "content": content,
-                    });
-                    if !tools.is_empty() {
-                        msg["tools"] = serde_json::Value::Array(tools);
-                    }
-                    Some(msg)
-                })
-                .collect();
+                }
+            }
+
+            let messages = built_messages;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -540,6 +652,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "running",
+        "version": env!("CARGO_PKG_VERSION"),
         "agent_count": agent_count,
         "default_provider": state.kernel.config.default_model.provider,
         "default_model": state.kernel.config.default_model.model,
@@ -1870,9 +1983,7 @@ fn build_field_json(
                     val.clone()
                 };
                 field["value"] = display_val;
-                if !val.is_null()
-                    && val.as_str().map(|s| !s.is_empty()).unwrap_or(true)
-                {
+                if !val.is_null() && val.as_str().map(|s| !s.is_empty()).unwrap_or(true) {
                     field["has_value"] = serde_json::Value::Bool(true);
                 }
             }
@@ -1892,46 +2003,166 @@ fn channel_config_values(
     name: &str,
 ) -> Option<serde_json::Value> {
     match name {
-        "telegram" => config.telegram.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "discord" => config.discord.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "slack" => config.slack.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "whatsapp" => config.whatsapp.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "signal" => config.signal.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "matrix" => config.matrix.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "email" => config.email.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "teams" => config.teams.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "mattermost" => config.mattermost.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "irc" => config.irc.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "google_chat" => config.google_chat.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "twitch" => config.twitch.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "rocketchat" => config.rocketchat.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "zulip" => config.zulip.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "xmpp" => config.xmpp.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "line" => config.line.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "viber" => config.viber.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "messenger" => config.messenger.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "reddit" => config.reddit.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "mastodon" => config.mastodon.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "bluesky" => config.bluesky.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "feishu" => config.feishu.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "revolt" => config.revolt.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "nextcloud" => config.nextcloud.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "guilded" => config.guilded.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "keybase" => config.keybase.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "threema" => config.threema.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "nostr" => config.nostr.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "webex" => config.webex.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "pumble" => config.pumble.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "flock" => config.flock.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "twist" => config.twist.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "mumble" => config.mumble.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "dingtalk" => config.dingtalk.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "discourse" => config.discourse.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "gitter" => config.gitter.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "ntfy" => config.ntfy.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "gotify" => config.gotify.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "webhook" => config.webhook.as_ref().and_then(|c| serde_json::to_value(c).ok()),
-        "linkedin" => config.linkedin.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "telegram" => config
+            .telegram
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "discord" => config
+            .discord
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "slack" => config
+            .slack
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "whatsapp" => config
+            .whatsapp
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "signal" => config
+            .signal
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "matrix" => config
+            .matrix
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "email" => config
+            .email
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "teams" => config
+            .teams
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "mattermost" => config
+            .mattermost
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "irc" => config
+            .irc
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "google_chat" => config
+            .google_chat
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "twitch" => config
+            .twitch
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "rocketchat" => config
+            .rocketchat
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "zulip" => config
+            .zulip
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "xmpp" => config
+            .xmpp
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "line" => config
+            .line
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "viber" => config
+            .viber
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "messenger" => config
+            .messenger
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "reddit" => config
+            .reddit
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "mastodon" => config
+            .mastodon
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "bluesky" => config
+            .bluesky
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "feishu" => config
+            .feishu
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "revolt" => config
+            .revolt
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "nextcloud" => config
+            .nextcloud
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "guilded" => config
+            .guilded
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "keybase" => config
+            .keybase
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "threema" => config
+            .threema
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "nostr" => config
+            .nostr
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "webex" => config
+            .webex
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "pumble" => config
+            .pumble
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "flock" => config
+            .flock
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "twist" => config
+            .twist
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "mumble" => config
+            .mumble
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "dingtalk" => config
+            .dingtalk
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "discourse" => config
+            .discourse
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "gitter" => config
+            .gitter
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "ntfy" => config
+            .ntfy
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "gotify" => config
+            .gotify
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "webhook" => config
+            .webhook
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "linkedin" => config
+            .linkedin
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
         _ => None,
     }
 }
@@ -2053,7 +2284,10 @@ pub async fn configure_channel(
             );
         } else {
             // Config field — collect for TOML write with type info
-            config_fields.insert(field_def.key.to_string(), (value.to_string(), field_def.field_type));
+            config_fields.insert(
+                field_def.key.to_string(),
+                (value.to_string(), field_def.field_type),
+            );
         }
     }
 
@@ -3057,7 +3291,9 @@ pub async fn clawhub_search(
                 "items": items,
                 "next_cursor": null,
             });
-            state.clawhub_cache.insert(cache_key, (Instant::now(), resp.clone()));
+            state
+                .clawhub_cache
+                .insert(cache_key, (Instant::now(), resp.clone()));
             (StatusCode::OK, Json(resp))
         }
         Err(e) => {
@@ -3071,9 +3307,7 @@ pub async fn clawhub_search(
             };
             (
                 status,
-                Json(
-                    serde_json::json!({"items": [], "next_cursor": null, "error": msg}),
-                ),
+                Json(serde_json::json!({"items": [], "next_cursor": null, "error": msg})),
             )
         }
     }
@@ -3126,7 +3360,9 @@ pub async fn clawhub_browse(
                 "items": items,
                 "next_cursor": results.next_cursor,
             });
-            state.clawhub_cache.insert(cache_key, (Instant::now(), resp.clone()));
+            state
+                .clawhub_cache
+                .insert(cache_key, (Instant::now(), resp.clone()));
             (StatusCode::OK, Json(resp))
         }
         Err(e) => {
@@ -3139,9 +3375,7 @@ pub async fn clawhub_browse(
             };
             (
                 status,
-                Json(
-                    serde_json::json!({"items": [], "next_cursor": null, "error": msg}),
-                ),
+                Json(serde_json::json!({"items": [], "next_cursor": null, "error": msg})),
             )
         }
     }
@@ -3308,7 +3542,10 @@ pub async fn clawhub_install(
                 StatusCode::FORBIDDEN
             } else if msg.contains("429") || msg.contains("rate limit") {
                 StatusCode::TOO_MANY_REQUESTS
-            } else if msg.contains("Network error") || msg.contains("returned 4") || msg.contains("returned 5") {
+            } else if msg.contains("Network error")
+                || msg.contains("returned 4")
+                || msg.contains("returned 5")
+            {
                 StatusCode::BAD_GATEWAY
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -3807,7 +4044,12 @@ pub async fn activate_hand(
             // If the hand agent has a non-reactive schedule (autonomous hands),
             // start its background loop so it begins running immediately.
             if let Some(agent_id) = instance.agent_id {
-                let entry = state.kernel.registry.list().into_iter().find(|e| e.id == agent_id);
+                let entry = state
+                    .kernel
+                    .registry
+                    .list()
+                    .into_iter()
+                    .find(|e| e.id == agent_id);
                 if let Some(entry) = entry {
                     if !matches!(
                         entry.manifest.schedule,
@@ -3963,7 +4205,9 @@ pub async fn update_hand_settings(
         },
         None => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("No active instance for hand: {hand_id}. Activate the hand first.")})),
+            Json(
+                serde_json::json!({"error": format!("No active instance for hand: {hand_id}. Activate the hand first.")}),
+            ),
         ),
     }
 }
@@ -4090,7 +4334,10 @@ pub async fn hand_instance_browser(
                 content = data["content"].as_str().unwrap_or("").to_string();
                 // Truncate content to avoid huge payloads (UTF-8 safe)
                 if content.len() > 2000 {
-                    content = format!("{}... (truncated)", openfang_types::truncate_str(&content, 2000));
+                    content = format!(
+                        "{}... (truncated)",
+                        openfang_types::truncate_str(&content, 2000)
+                    );
                 }
             }
         }
@@ -4746,7 +4993,9 @@ pub async fn update_agent_budget(
     if hourly.is_none() && daily.is_none() && monthly.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Provide at least one of: max_cost_per_hour_usd, max_cost_per_day_usd, max_cost_per_month_usd"})),
+            Json(
+                serde_json::json!({"error": "Provide at least one of: max_cost_per_hour_usd, max_cost_per_day_usd, max_cost_per_month_usd"}),
+            ),
         );
     }
 
@@ -4986,6 +5235,92 @@ pub async fn update_agent(
             "note": "Full manifest update requires agent restart. Use DELETE + POST to apply.",
         })),
     )
+}
+
+/// PATCH /api/agents/{id} — Partial update of agent fields (name, description, model, system_prompt).
+pub async fn patch_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    if state.kernel.registry.get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        );
+    }
+
+    // Apply partial updates using dedicated registry methods
+    if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
+        if let Err(e) = state
+            .kernel
+            .registry
+            .update_name(agent_id, name.to_string())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+    }
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+        if let Err(e) = state
+            .kernel
+            .registry
+            .update_description(agent_id, desc.to_string())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+    }
+    if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+        if let Err(e) = state.kernel.set_agent_model(agent_id, model) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+    }
+    if let Some(system_prompt) = body.get("system_prompt").and_then(|v| v.as_str()) {
+        if let Err(e) = state
+            .kernel
+            .registry
+            .update_system_prompt(agent_id, system_prompt.to_string())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+    }
+
+    // Persist updated entry to SQLite
+    if let Some(entry) = state.kernel.registry.get(agent_id) {
+        let _ = state.kernel.memory.save_agent(&entry);
+        (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({"status": "ok", "agent_id": entry.id.to_string(), "name": entry.name}),
+            ),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Agent vanished during update"})),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5465,7 +5800,9 @@ pub async fn add_custom_model(
     if !catalog.add_custom_model(entry) {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": format!("Model '{}' already exists for provider '{}'", id, provider)})),
+            Json(
+                serde_json::json!({"error": format!("Model '{}' already exists for provider '{}'", id, provider)}),
+            ),
         );
     }
 
@@ -5601,7 +5938,7 @@ pub async fn a2a_send_task(
     let task = openfang_runtime::a2a::A2aTask {
         id: task_id.clone(),
         session_id: session_id.clone(),
-        status: openfang_runtime::a2a::A2aTaskStatus::Working,
+        status: openfang_runtime::a2a::A2aTaskStatus::Working.into(),
         messages: vec![openfang_runtime::a2a::A2aMessage {
             role: "user".to_string(),
             parts: vec![openfang_runtime::a2a::A2aPart::Text {
@@ -5710,10 +6047,10 @@ pub async fn a2a_list_external_agents(State(state): State<Arc<AppState>>) -> imp
         .unwrap_or_else(|e| e.into_inner());
     let items: Vec<serde_json::Value> = agents
         .iter()
-        .map(|(url, card)| {
+        .map(|(_, card)| {
             serde_json::json!({
                 "name": card.name,
-                "url": url,
+                "url": card.url,
                 "description": card.description,
                 "skills": card.skills,
                 "version": card.version,
@@ -6071,6 +6408,12 @@ pub async fn clear_agent_history(
             )
         }
     };
+    if state.kernel.registry.get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        );
+    }
     match state.kernel.clear_agent_history(agent_id) {
         Ok(()) => (
             StatusCode::OK,
@@ -6164,10 +6507,19 @@ pub async fn set_model(
         }
     };
     match state.kernel.set_agent_model(agent_id, model) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "ok", "model": model})),
-        ),
+        Ok(()) => {
+            // Return the resolved provider so frontend can update its state
+            let provider = state
+                .kernel
+                .registry
+                .get(agent_id)
+                .map(|e| e.manifest.model.provider.clone())
+                .unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ok", "model": model, "provider": provider})),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("{e}")})),
@@ -6250,10 +6602,7 @@ pub async fn set_agent_tools(
         .kernel
         .set_agent_tool_filters(agent_id, allowlist, blocklist)
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "ok"})),
-        ),
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("{e}")})),
@@ -6463,10 +6812,7 @@ pub async fn set_provider_key(
             .map(|p| p.api_key_env.clone())
             .unwrap_or_else(|| {
                 // Custom provider — derive env var: MY_PROVIDER → MY_PROVIDER_API_KEY
-                format!(
-                    "{}_API_KEY",
-                    name.to_uppercase().replace('-', "_")
-                )
+                format!("{}_API_KEY", name.to_uppercase().replace('-', "_"))
             })
     };
 
@@ -6490,10 +6836,59 @@ pub async fn set_provider_key(
         .unwrap_or_else(|e| e.into_inner())
         .detect_auth();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "saved", "provider": name})),
-    )
+    // Auto-switch default provider if current default has no working key.
+    // This fixes the common case where a user adds e.g. a Gemini key via dashboard
+    // but their agent still tries to use the previous provider (which has no key).
+    let current_provider = &state.kernel.config.default_model.provider;
+    let current_key_env = &state.kernel.config.default_model.api_key_env;
+    let current_has_key = if current_key_env.is_empty() {
+        false
+    } else {
+        std::env::var(current_key_env).is_ok()
+    };
+    let switched = if !current_has_key && *current_provider != name {
+        // Find a default model for the newly-keyed provider
+        let default_model = {
+            let catalog = state
+                .kernel
+                .model_catalog
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            catalog.default_model_for_provider(&name)
+        };
+        if let Some(model_id) = default_model {
+            // Update config.toml to persist the switch
+            let config_path = state.kernel.config.home_dir.join("config.toml");
+            let update_toml = format!(
+                "\n[default_model]\nprovider = \"{}\"\nmodel = \"{}\"\napi_key_env = \"{}\"\n",
+                name, model_id, env_var
+            );
+            if let Ok(existing) = std::fs::read_to_string(&config_path) {
+                // Remove existing [default_model] section if present, then append
+                let cleaned = remove_toml_section(&existing, "default_model");
+                let _ =
+                    std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml));
+            } else {
+                let _ = std::fs::write(&config_path, update_toml);
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let mut resp = serde_json::json!({"status": "saved", "provider": name});
+    if switched {
+        resp["switched_default"] = serde_json::json!(true);
+        resp["message"] = serde_json::json!(format!(
+            "API key saved. Default provider switched to '{}'. Restart the daemon to apply.",
+            name
+        ));
+    }
+
+    (StatusCode::OK, Json(resp))
 }
 
 /// DELETE /api/providers/{name}/key — Remove an API key for a provider.
@@ -6695,8 +7090,7 @@ pub async fn set_provider_url(
     }
 
     // Probe reachability at the new URL
-    let probe =
-        openfang_runtime::provider_health::probe_provider(&name, &base_url).await;
+    let probe = openfang_runtime::provider_health::probe_provider(&name, &base_url).await;
 
     // Merge discovered models into catalog
     if !probe.discovered_models.is_empty() {
@@ -6943,15 +7337,14 @@ fn upsert_channel_config(
                 }
             }
             FieldType::List => {
+                // Always store list items as strings so that numeric IDs
+                // (e.g. Discord guild snowflakes, Telegram user IDs) are
+                // deserialized correctly into Vec<String> config fields.
                 let items: Vec<toml::Value> = v
                     .split(',')
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        s.parse::<i64>()
-                            .map(toml::Value::Integer)
-                            .unwrap_or_else(|_| toml::Value::String(s.to_string()))
-                    })
+                    .map(|s| toml::Value::String(s.to_string()))
                     .collect();
                 toml::Value::Array(items)
             }
@@ -7591,7 +7984,11 @@ pub async fn run_schedule(
     );
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state.kernel.send_message_with_handle(target_agent, &run_message, Some(kernel_handle)).await {
+    match state
+        .kernel
+        .send_message_with_handle(target_agent, &run_message, Some(kernel_handle))
+        .await
+    {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -7745,7 +8142,9 @@ pub async fn patch_agent_config(
         if name.len() > MAX_NAME_LEN {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({"error": format!("Name exceeds max length ({MAX_NAME_LEN} chars)")})),
+                Json(
+                    serde_json::json!({"error": format!("Name exceeds max length ({MAX_NAME_LEN} chars)")}),
+                ),
             );
         }
     }
@@ -7753,7 +8152,9 @@ pub async fn patch_agent_config(
         if desc.len() > MAX_DESC_LEN {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({"error": format!("Description exceeds max length ({MAX_DESC_LEN} chars)")})),
+                Json(
+                    serde_json::json!({"error": format!("Description exceeds max length ({MAX_DESC_LEN} chars)")}),
+                ),
             );
         }
     }
@@ -7761,7 +8162,9 @@ pub async fn patch_agent_config(
         if prompt.len() > MAX_PROMPT_LEN {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({"error": format!("System prompt exceeds max length ({MAX_PROMPT_LEN} chars)")})),
+                Json(
+                    serde_json::json!({"error": format!("System prompt exceeds max length ({MAX_PROMPT_LEN} chars)")}),
+                ),
             );
         }
     }
@@ -8753,12 +9156,18 @@ pub async fn config_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
 // ---------------------------------------------------------------------------
 
 /// GET /api/config/schema — Return a simplified JSON description of the config structure.
-pub async fn config_schema(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Build provider/model options from model catalog for dropdowns
-    let catalog = state.kernel.model_catalog.read().unwrap_or_else(|e| e.into_inner());
-    let provider_options: Vec<String> = catalog.list_providers().iter().map(|p| p.id.clone()).collect();
+    let catalog = state
+        .kernel
+        .model_catalog
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let provider_options: Vec<String> = catalog
+        .list_providers()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
     let model_options: Vec<serde_json::Value> = catalog
         .list_models()
         .iter()
@@ -8768,7 +9177,8 @@ pub async fn config_schema(
 
     Json(serde_json::json!({
         "sections": {
-            "api": {
+            "general": {
+                "root_level": true,
                 "fields": {
                     "api_listen": "string",
                     "api_key": "string",
@@ -9611,8 +10021,7 @@ pub async fn copilot_oauth_start() -> impl IntoResponse {
                 CopilotFlowState {
                     device_code: resp.device_code,
                     interval: resp.interval,
-                    expires_at: Instant::now()
-                        + std::time::Duration::from_secs(resp.expires_in),
+                    expires_at: Instant::now() + std::time::Duration::from_secs(resp.expires_in),
                 },
             );
 
@@ -9676,7 +10085,9 @@ pub async fn copilot_oauth_poll(
             if let Err(e) = write_secret_env(&secrets_path, "GITHUB_TOKEN", &access_token) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"status": "error", "error": format!("Failed to save token: {e}")})),
+                    Json(
+                        serde_json::json!({"status": "error", "error": format!("Failed to save token: {e}")}),
+                    ),
                 );
             }
 
@@ -9880,15 +10291,30 @@ fn audit_to_comms_event(
             // Format detail: "tokens_in=X, tokens_out=Y" → readable summary
             let detail = if entry.detail.starts_with("tokens_in=") {
                 let parts: Vec<&str> = entry.detail.split(", ").collect();
-                let in_tok = parts.first().and_then(|p| p.strip_prefix("tokens_in=")).unwrap_or("?");
-                let out_tok = parts.get(1).and_then(|p| p.strip_prefix("tokens_out=")).unwrap_or("?");
+                let in_tok = parts
+                    .first()
+                    .and_then(|p| p.strip_prefix("tokens_in="))
+                    .unwrap_or("?");
+                let out_tok = parts
+                    .get(1)
+                    .and_then(|p| p.strip_prefix("tokens_out="))
+                    .unwrap_or("?");
                 if entry.outcome == "ok" {
                     format!("{} in / {} out tokens", in_tok, out_tok)
                 } else {
-                    format!("{} in / {} out — {}", in_tok, out_tok, openfang_types::truncate_str(&entry.outcome, 80))
+                    format!(
+                        "{} in / {} out — {}",
+                        in_tok,
+                        out_tok,
+                        openfang_types::truncate_str(&entry.outcome, 80)
+                    )
                 }
             } else if entry.outcome != "ok" {
-                format!("{} — {}", openfang_types::truncate_str(&entry.detail, 80), openfang_types::truncate_str(&entry.outcome, 80))
+                format!(
+                    "{} — {}",
+                    openfang_types::truncate_str(&entry.detail, 80),
+                    openfang_types::truncate_str(&entry.outcome, 80)
+                )
             } else {
                 openfang_types::truncate_str(&entry.detail, 200).to_string()
             };
@@ -9896,12 +10322,18 @@ fn audit_to_comms_event(
         }
         "AgentSpawn" => (
             CommsEventKind::AgentSpawned,
-            format!("Agent spawned: {}", openfang_types::truncate_str(&entry.detail, 100)),
+            format!(
+                "Agent spawned: {}",
+                openfang_types::truncate_str(&entry.detail, 100)
+            ),
             "",
         ),
         "AgentKill" => (
             CommsEventKind::AgentTerminated,
-            format!("Agent killed: {}", openfang_types::truncate_str(&entry.detail, 100)),
+            format!(
+                "Agent killed: {}",
+                openfang_types::truncate_str(&entry.detail, 100)
+            ),
             "",
         ),
         _ => return None,
@@ -9913,8 +10345,16 @@ fn audit_to_comms_event(
         kind,
         source_id: entry.agent_id.clone(),
         source_name: resolve_name(&entry.agent_id),
-        target_id: if target_label.is_empty() { String::new() } else { target_label.to_string() },
-        target_name: if target_label.is_empty() { String::new() } else { target_label.to_string() },
+        target_id: if target_label.is_empty() {
+            String::new()
+        } else {
+            target_label.to_string()
+        },
+        target_name: if target_label.is_empty() {
+            String::new()
+        } else {
+            target_label.to_string()
+        },
         detail,
     })
 }
@@ -9965,9 +10405,7 @@ pub async fn comms_events(
 /// GET /api/comms/events/stream — SSE stream of inter-agent communication events.
 ///
 /// Polls the audit log every 500ms for new inter-agent events.
-pub async fn comms_events_stream(
-    State(state): State<Arc<AppState>>,
-) -> axum::response::Response {
+pub async fn comms_events_stream(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::sse::{Event, KeepAlive, Sse};
 
     let (tx, rx) = tokio::sync::mpsc::channel::<
@@ -10113,4 +10551,26 @@ pub async fn comms_task(
             Json(serde_json::json!({"error": format!("Failed to post task: {e}")})),
         ),
     }
+}
+
+/// Remove a `[section]` and its contents from a TOML string.
+fn remove_toml_section(content: &str, section: &str) -> String {
+    let header = format!("[{}]", section);
+    let mut result = String::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            skipping = true;
+            continue;
+        }
+        if skipping && trimmed.starts_with('[') {
+            skipping = false;
+        }
+        if !skipping {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
 }

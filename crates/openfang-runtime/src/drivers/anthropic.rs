@@ -570,7 +570,9 @@ fn convert_message(msg: &Message) -> ApiMessage {
                             data: data.clone(),
                         },
                     }),
-                    ContentBlock::ToolUse { id, name, input, .. } => Some(ApiContentBlock::ToolUse {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => Some(ApiContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
@@ -609,7 +611,9 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
             ResponseContentBlock::Text { text } => {
                 content.push(ContentBlock::Text { text });
             }
-            ResponseContentBlock::ToolUse { id, name, input, .. } => {
+            ResponseContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),

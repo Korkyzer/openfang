@@ -19,22 +19,19 @@ const MAX_AGENT_CALL_DEPTH: u32 = 5;
 
 /// Check if a shell command should be blocked by taint tracking.
 ///
-/// Commands containing patterns that look like injected external data
-/// (e.g., piped curl commands, base64-encoded payloads) are flagged.
+/// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
+/// Layer 2: Heuristic patterns for injected external data (piped curl, base64, eval)
+///
 /// This implements the TaintSink::shell_exec() policy from SOTA 2.
 fn check_taint_shell_exec(command: &str) -> Option<String> {
-    // Heuristic: flag commands that look like they contain embedded external URLs
-    // or base64 payloads (common injection patterns)
-    let suspicious_patterns = [
-        "curl ",
-        "wget ",
-        "| sh",
-        "| bash",
-        "base64 -d",
-        "$(curl",
-        "`curl",
-        "eval ",
-    ];
+    // Layer 1: Block shell metacharacters that enable command injection.
+    // Uses the same validator as subprocess_sandbox and docker_sandbox.
+    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+        return Some(format!("Shell metacharacter injection blocked: {reason}"));
+    }
+
+    // Layer 2: Heuristic patterns for injected external URLs / base64 payloads
+    let suspicious_patterns = ["curl ", "wget ", "| sh", "| bash", "base64 -d", "eval "];
     for pattern in &suspicious_patterns {
         if command.contains(pattern) {
             let mut labels = HashSet::new();
@@ -191,7 +188,9 @@ pub async fn execute_tool(
             let headers = input.get("headers").and_then(|v| v.as_object());
             let body = input["body"].as_str();
             if let Some(ctx) = web_ctx {
-                ctx.fetch.fetch_with_options(url, method, headers, body).await
+                ctx.fetch
+                    .fetch_with_options(url, method, headers, body)
+                    .await
             } else {
                 tool_web_fetch_legacy(input).await
             }
@@ -206,10 +205,25 @@ pub async fn execute_tool(
             }
         }
 
-        // Shell tool — exec policy + taint check
+        // Shell tool — metacharacter check + exec policy + taint check
         "shell_exec" => {
             let command = input["command"].as_str().unwrap_or("");
-            // Exec policy enforcement
+
+            // SECURITY: Always check for shell metacharacters, even in Full mode.
+            // These enable command injection regardless of exec policy.
+            if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command)
+            {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!(
+                        "shell_exec blocked: command contains {reason}. \
+                         Shell metacharacters are never allowed."
+                    ),
+                    is_error: true,
+                };
+            }
+
+            // Exec policy enforcement (allowlist / deny / full)
             if let Some(policy) = exec_policy {
                 if let Err(reason) =
                     crate::subprocess_sandbox::validate_command_allowlist(command, policy)
@@ -225,10 +239,18 @@ pub async fn execute_tool(
                     };
                 }
             }
-            // Skip taint check for Full exec policy (e.g. hand agents that need curl for APIs)
-            let is_full_exec = exec_policy
-                .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full);
-            if !is_full_exec {
+            // Skip heuristic taint patterns when exec policy explicitly allows
+            // the command (Full mode or base command in the allowlist).
+            let skip_taint_heuristic = exec_policy.is_some_and(|p| match p.mode {
+                openfang_types::config::ExecSecurityMode::Full => true,
+                openfang_types::config::ExecSecurityMode::Allowlist => {
+                    let base = crate::subprocess_sandbox::extract_base_command(command);
+                    p.safe_bins.iter().any(|sb| sb == base)
+                        || p.allowed_commands.iter().any(|ac| ac == base)
+                }
+                _ => false,
+            });
+            if !skip_taint_heuristic {
                 if let Some(violation) = check_taint_shell_exec(command) {
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
@@ -296,6 +318,9 @@ pub async fn execute_tool(
         // Location tool
         "location_get" => tool_location_get().await,
 
+        // System time tool
+        "system_time" => Ok(tool_system_time()),
+
         // Cron scheduling tools
         "cron_create" => tool_cron_create(input, kernel, caller_agent_id).await,
         "cron_list" => tool_cron_list(kernel, caller_agent_id).await,
@@ -337,8 +362,7 @@ pub async fn execute_tool(
                     crate::browser::tool_browser_navigate(input, mgr, aid).await
                 }
                 None => Err(
-                    "Browser tools not available. Ensure Chrome/Chromium is installed."
-                        .to_string(),
+                    "Browser tools not available. Ensure Chrome/Chromium is installed.".to_string(),
                 ),
             }
         }
@@ -347,63 +371,81 @@ pub async fn execute_tool(
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_click(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_type" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_type(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_screenshot" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_screenshot(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_read_page" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_read_page(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_close" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_close(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_scroll" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_scroll(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_wait" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_wait(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_run_js" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_run_js(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_back" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_back(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
 
         // Canvas / A2UI tool
@@ -1177,6 +1219,16 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
+        // --- System time tool ---
+        ToolDefinition {
+            name: "system_time".to_string(),
+            description: "Get the current date, time, and timezone. Returns ISO 8601 timestamp, Unix epoch seconds, and timezone info.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
         // --- Canvas / A2UI tool ---
         ToolDefinition {
             name: "canvas_present".to_string(),
@@ -1405,39 +1457,66 @@ async fn tool_shell_exec(
     let policy_timeout = exec_policy.map(|p| p.timeout_secs).unwrap_or(30);
     let timeout_secs = input["timeout_seconds"].as_u64().unwrap_or(policy_timeout);
 
-    // Shell resolution: prefer sh (Git Bash/MSYS2) on Windows to avoid cmd.exe
-    // quoting issues (% expansion mangles yt-dlp templates, " in filenames
-    // converted to # by --restrict-filenames). Fall back to cmd if sh not found.
-    #[cfg(windows)]
-    let git_sh: Option<&str> = {
-        const SH_PATHS: &[&str] = &[
-            "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
-            "C:\\Program Files (x86)\\Git\\usr\\bin\\sh.exe",
-        ];
-        SH_PATHS
-            .iter()
-            .copied()
-            .find(|p| std::path::Path::new(p).exists())
-    };
-    let (shell, shell_arg) = if cfg!(windows) {
-        #[cfg(windows)]
-        {
-            if let Some(sh) = git_sh {
-                (sh, "-c")
-            } else {
-                ("cmd", "/C")
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            ("sh", "-c")
-        }
-    } else {
-        ("sh", "-c")
-    };
+    // SECURITY: Determine execution strategy based on exec policy.
+    //
+    // In Allowlist mode (default): Use direct execution via shlex argv splitting.
+    // This avoids invoking a shell interpreter, which eliminates an entire class
+    // of injection attacks (encoding tricks, $IFS, glob expansion, etc.).
+    //
+    // In Full mode: User explicitly opted into unrestricted shell access,
+    // so we use sh -c / cmd /C as before.
+    let use_direct_exec = exec_policy
+        .map(|p| p.mode == openfang_types::config::ExecSecurityMode::Allowlist)
+        .unwrap_or(true); // Default to safe mode
 
-    let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg(shell_arg).arg(command);
+    let mut cmd = if use_direct_exec {
+        // SAFE PATH: Split command into argv using POSIX shell lexer rules,
+        // then execute the binary directly — no shell interpreter involved.
+        let argv = shlex::split(command).ok_or_else(|| {
+            "Command contains unmatched quotes or invalid shell syntax".to_string()
+        })?;
+        if argv.is_empty() {
+            return Err("Empty command after parsing".to_string());
+        }
+        let mut c = tokio::process::Command::new(&argv[0]);
+        if argv.len() > 1 {
+            c.args(&argv[1..]);
+        }
+        c
+    } else {
+        // UNSAFE PATH: Full mode — user explicitly opted in to shell interpretation.
+        // Shell resolution: prefer sh (Git Bash/MSYS2) on Windows.
+        #[cfg(windows)]
+        let git_sh: Option<&str> = {
+            const SH_PATHS: &[&str] = &[
+                "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
+                "C:\\Program Files (x86)\\Git\\usr\\bin\\sh.exe",
+            ];
+            SH_PATHS
+                .iter()
+                .copied()
+                .find(|p| std::path::Path::new(p).exists())
+        };
+        let (shell, shell_arg) = if cfg!(windows) {
+            #[cfg(windows)]
+            {
+                if let Some(sh) = git_sh {
+                    (sh, "-c")
+                } else {
+                    ("cmd", "/C")
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                ("sh", "-c")
+            }
+        } else {
+            ("sh", "-c")
+        };
+        let mut c = tokio::process::Command::new(shell);
+        c.arg(shell_arg).arg(command);
+        c
+    };
 
     // Set working directory to agent workspace so files are created there
     if let Some(ws) = workspace_root {
@@ -2538,6 +2617,27 @@ async fn tool_location_get() -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// System time tool
+// ---------------------------------------------------------------------------
+
+/// Return current date, time, timezone, and Unix epoch.
+fn tool_system_time() -> String {
+    let now_utc = chrono::Utc::now();
+    let now_local = chrono::Local::now();
+    let result = serde_json::json!({
+        "utc": now_utc.to_rfc3339(),
+        "local": now_local.to_rfc3339(),
+        "unix_epoch": now_utc.timestamp(),
+        "timezone": now_local.format("%Z").to_string(),
+        "utc_offset": now_local.format("%:z").to_string(),
+        "date": now_local.format("%Y-%m-%d").to_string(),
+        "time": now_local.format("%H:%M:%S").to_string(),
+        "day_of_week": now_local.format("%A").to_string(),
+    });
+    serde_json::to_string_pretty(&result).unwrap_or_else(|_| now_utc.to_rfc3339())
+}
+
+// ---------------------------------------------------------------------------
 // Media understanding tools
 // ---------------------------------------------------------------------------
 
@@ -3114,6 +3214,7 @@ mod tests {
         assert!(names.contains(&"schedule_delete"));
         assert!(names.contains(&"image_analyze"));
         assert!(names.contains(&"location_get"));
+        assert!(names.contains(&"system_time"));
         // 6 browser tools
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));

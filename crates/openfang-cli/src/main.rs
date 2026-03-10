@@ -1021,7 +1021,10 @@ fn main() {
             SystemCommands::Version { json } => cmd_system_version(json),
         },
         Some(Commands::Reset { confirm }) => cmd_reset(confirm),
-        Some(Commands::Uninstall { confirm, keep_config }) => cmd_uninstall(confirm, keep_config),
+        Some(Commands::Uninstall {
+            confirm,
+            keep_config,
+        }) => cmd_uninstall(confirm, keep_config),
     }
 }
 
@@ -1163,6 +1166,12 @@ fn cmd_init(quick: bool) {
 
     if quick {
         cmd_init_quick(&openfang_dir);
+    } else if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        ui::hint("Non-interactive terminal detected — running in quick mode");
+        ui::hint("For the interactive wizard, run: openfang init (in a terminal)");
+        cmd_init_quick(&openfang_dir);
     } else {
         cmd_init_interactive(&openfang_dir);
     }
@@ -1283,9 +1292,10 @@ fn launch_desktop_app(_openfang_dir: &std::path::Path) {
             ui::blank();
             if let Some(base) = find_daemon() {
                 let url = format!("{base}/");
-                if !open_in_browser(&url) {
-                    ui::hint(&format!("Visit: {url}"));
-                }
+                let _ = open_in_browser(&url);
+                // Always print the URL — browser launch may silently fail
+                // (e.g., Chromium sandbox EPERM in containers)
+                ui::hint(&format!("Dashboard: {url}"));
             }
         }
     }
@@ -1333,7 +1343,7 @@ fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static st
         (
             "openrouter",
             "OPENROUTER_API_KEY",
-            "openrouter/auto",
+            "openrouter/anthropic/claude-sonnet-4",
             "OpenRouter",
         ),
     ]
@@ -2157,7 +2167,9 @@ decay_rate = 0.05
                     if !json {
                         ui::check_ok(&format!("Port {api_listen} is available"));
                     }
-                    checks.push(serde_json::json!({"check": "port", "status": "ok", "address": api_listen}));
+                    checks.push(
+                        serde_json::json!({"check": "port", "status": "ok", "address": api_listen}),
+                    );
                 }
                 Err(_) => {
                     if !json {
@@ -2628,7 +2640,7 @@ decay_rate = 0.05
                         checks.push(serde_json::json!({"check": "daemon_uptime", "status": "ok", "secs": uptime}));
                     }
                     if let Some(db_status) = body.get("database").and_then(|v| v.as_str()) {
-                        if db_status == "ok" {
+                        if db_status == "connected" || db_status == "ok" {
                             if !json {
                                 ui::check_ok("Database connectivity: OK");
                             }
@@ -2702,12 +2714,18 @@ decay_rate = 0.05
         match client.get(format!("{base}/api/integrations/health")).send() {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    if let Some(obj) = body.as_object() {
-                        let healthy = obj
-                            .values()
-                            .filter(|v| v.get("healthy").and_then(|h| h.as_bool()).unwrap_or(false))
+                    let entries = body.get("health").and_then(|h| h.as_array());
+                    if let Some(arr) = entries {
+                        let healthy = arr
+                            .iter()
+                            .filter(|v| {
+                                v.get("status")
+                                    .and_then(|s| s.as_str())
+                                    .map(|s| s.eq_ignore_ascii_case("ready"))
+                                    .unwrap_or(false)
+                            })
                             .count();
-                        let total = obj.len();
+                        let total = arr.len();
                         if healthy == total {
                             if !json {
                                 ui::check_ok(&format!(
@@ -2950,8 +2968,14 @@ pub(crate) fn open_in_browser(url: &str) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
+        // Detach from parent to avoid inheriting sandbox restrictions.
+        // Some Chromium-based browsers fail with EPERM when launched from
+        // restricted environments (containers, snaps, flatpaks).
         std::process::Command::new("xdg-open")
             .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .is_ok()
     }
@@ -3932,7 +3956,10 @@ fn cmd_hand_install(path: &str) {
         body["name"].as_str().unwrap_or("?"),
         body["id"].as_str().unwrap_or("?"),
     );
-    println!("Use `openfang hand activate {}` to start it.", body["id"].as_str().unwrap_or("?"));
+    println!(
+        "Use `openfang hand activate {}` to start it.",
+        body["id"].as_str().unwrap_or("?")
+    );
 }
 
 fn cmd_hand_list() {
@@ -3957,10 +3984,7 @@ fn cmd_hand_list() {
             println!("No hands available.");
             return;
         }
-        println!(
-            "{:<14} {:<20} {:<10} DESCRIPTION",
-            "ID", "NAME", "CATEGORY"
-        );
+        println!("{:<14} {:<20} {:<10} DESCRIPTION", "ID", "NAME", "CATEGORY");
         println!("{}", "-".repeat(72));
         for h in arr {
             println!(
@@ -3968,7 +3992,12 @@ fn cmd_hand_list() {
                 h["id"].as_str().unwrap_or("?"),
                 h["name"].as_str().unwrap_or("?"),
                 h["category"].as_str().unwrap_or("?"),
-                h["description"].as_str().unwrap_or("").chars().take(40).collect::<String>(),
+                h["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(40)
+                    .collect::<String>(),
             );
         }
         println!("\nUse `openfang hand activate <id>` to activate a hand.");
@@ -3990,10 +4019,7 @@ fn cmd_hand_active() {
         println!("No active hands.");
         return;
     }
-    println!(
-        "{:<38} {:<14} {:<10} AGENT",
-        "INSTANCE", "HAND", "STATUS"
-    );
+    println!("{:<38} {:<14} {:<10} AGENT", "INSTANCE", "HAND", "STATUS");
     println!("{}", "-".repeat(72));
     for i in &arr {
         println!(
@@ -4081,10 +4107,7 @@ fn cmd_hand_info(id: &str) {
     let client = daemon_client();
     let body = daemon_json(client.get(format!("{base}/api/hands/{id}")).send());
     if body.get("error").is_some() {
-        eprintln!(
-            "Hand not found: {}",
-            body["error"].as_str().unwrap_or(id)
-        );
+        eprintln!("Hand not found: {}", body["error"].as_str().unwrap_or(id));
         std::process::exit(1);
     }
     println!(
@@ -5403,7 +5426,15 @@ fn cmd_cron_create(agent: &str, spec: &str, prompt: &str, explicit_name: Option<
             .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
             .take(64)
             .collect();
-        format!("{}-{}", agent, if short_prompt.is_empty() { "job" } else { &short_prompt })
+        format!(
+            "{}-{}",
+            agent,
+            if short_prompt.is_empty() {
+                "job"
+            } else {
+                &short_prompt
+            }
+        )
     };
 
     let body = daemon_json(
@@ -6157,10 +6188,7 @@ fn cmd_uninstall(confirm: bool, keep_config: bool) {
         } else {
             match std::fs::remove_dir_all(&openfang_dir) {
                 Ok(()) => ui::success(&format!("Removed {}", openfang_dir.display())),
-                Err(e) => ui::error(&format!(
-                    "Failed to remove {}: {e}",
-                    openfang_dir.display()
-                )),
+                Err(e) => ui::error(&format!("Failed to remove {}: {e}", openfang_dir.display())),
             }
         }
     }
@@ -6169,10 +6197,7 @@ fn cmd_uninstall(confirm: bool, keep_config: bool) {
     if cargo_bin.exists() && exe_path.as_ref().is_none_or(|e| *e != cargo_bin) {
         match std::fs::remove_file(&cargo_bin) {
             Ok(()) => ui::success(&format!("Removed {}", cargo_bin.display())),
-            Err(e) => ui::error(&format!(
-                "Failed to remove {}: {e}",
-                cargo_bin.display()
-            )),
+            Err(e) => ui::error(&format!("Failed to remove {}: {e}", cargo_bin.display())),
         }
     }
 
@@ -6412,7 +6437,10 @@ fn remove_self_binary(exe_path: &std::path::Path) {
             .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
             .spawn();
 
-        ui::success(&format!("Removed {} (deferred cleanup)", exe_path.display()));
+        ui::success(&format!(
+            "Removed {} (deferred cleanup)",
+            exe_path.display()
+        ));
     }
 }
 

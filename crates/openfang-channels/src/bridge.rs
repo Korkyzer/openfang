@@ -408,7 +408,9 @@ async fn dispatch_message(
                 }
                 GroupPolicy::MentionOnly => {
                     // Only allow messages where the bot was @mentioned or commands.
-                    let was_mentioned = message.metadata.get("was_mentioned")
+                    let was_mentioned = message
+                        .metadata
+                        .get("was_mentioned")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let is_command = matches!(&message.content, ChannelContent::Command { .. });
@@ -453,16 +455,30 @@ async fn dispatch_message(
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
-        _ => {
-            send_response(
-                adapter,
-                &message.sender,
-                "I can only handle text messages for now.".to_string(),
-                thread_id,
-                output_format,
-            )
-            .await;
-            return;
+        ChannelContent::Image {
+            ref url,
+            ref caption,
+        } => {
+            let desc = match caption {
+                Some(c) => format!("[User sent a photo: {url}]\nCaption: {c}"),
+                None => format!("[User sent a photo: {url}]"),
+            };
+            desc
+        }
+        ChannelContent::File {
+            ref url,
+            ref filename,
+        } => {
+            format!("[User sent a file ({filename}): {url}]")
+        }
+        ChannelContent::Voice {
+            ref url,
+            duration_seconds,
+        } => {
+            format!("[User sent a voice message ({duration_seconds}s): {url}]")
+        }
+        ChannelContent::Location { lat, lon } => {
+            format!("[User shared location: {lat}, {lon}]")
         }
     };
 
@@ -645,13 +661,54 @@ async fn dispatch_message(
         return;
     }
 
-    // Send typing indicator (best-effort)
-    let _ = adapter.send_typing(&message.sender).await;
+    // Send placeholder message or fall back to typing indicator
+    let placeholder_result = adapter
+        .send_placeholder(&message.sender, "\u{23f3}", thread_id)
+        .await
+        .map_err(|e| e.to_string());
+    let placeholder_id = match placeholder_result {
+        Ok(Some(id)) => {
+            debug!("Placeholder sent (id={id})");
+            Some(id)
+        }
+        Ok(None) => {
+            // Adapter does not support placeholders - send typing indicator instead
+            let _ = adapter.send_typing(&message.sender).await;
+            None
+        }
+        Err(msg) => {
+            warn!("Placeholder failed: {msg}, falling back to typing");
+            let _ = adapter.send_typing(&message.sender).await;
+            None
+        }
+    };
 
     // Send to agent and relay response
     match handle.send_message(agent_id, &text).await {
         Ok(response) => {
-            send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            let formatted = formatter::format_for_channel(&response, output_format);
+            if let Some(ref pid) = placeholder_id {
+                if formatted.len() > 1800 {
+                    // Response too long for edit -- delete placeholder, send as new message(s)
+                    let _ = adapter.delete_message(&message.sender, pid).await;
+                    send_response(adapter, &message.sender, response, thread_id, output_format)
+                        .await;
+                } else {
+                    // Edit placeholder with actual response
+                    let content = ChannelContent::Text(formatted);
+                    if let Err(e) = adapter
+                        .edit_message(&message.sender, pid, content)
+                        .await
+                        .map_err(|e| e.to_string())
+                    {
+                        warn!("Failed to edit placeholder: {e}, sending new message");
+                        send_response(adapter, &message.sender, response, thread_id, output_format)
+                            .await;
+                    }
+                }
+            } else {
+                send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            }
             handle
                 .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
                 .await;
@@ -659,14 +716,19 @@ async fn dispatch_message(
         Err(e) => {
             warn!("Agent error for {agent_id}: {e}");
             let err_msg = format!("Agent error: {e}");
-            send_response(
-                adapter,
-                &message.sender,
-                err_msg.clone(),
-                thread_id,
-                output_format,
-            )
-            .await;
+            if let Some(ref pid) = placeholder_id {
+                let content = ChannelContent::Text(err_msg.clone());
+                let _ = adapter.edit_message(&message.sender, pid, content).await;
+            } else {
+                send_response(
+                    adapter,
+                    &message.sender,
+                    err_msg.clone(),
+                    thread_id,
+                    output_format,
+                )
+                .await;
+            }
             handle
                 .record_delivery(
                     agent_id,

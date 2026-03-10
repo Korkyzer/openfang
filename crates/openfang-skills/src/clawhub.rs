@@ -427,25 +427,43 @@ impl ClawHubClient {
 
         info!(slug, "Downloading skill from ClawHub");
 
-        let response = self
-            .client
-            .get(&url)
-            .header("User-Agent", "OpenFang/0.1")
-            .send()
-            .await
-            .map_err(|e| SkillError::Network(format!("ClawHub download failed: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(SkillError::Network(format!(
-                "ClawHub download returned {}",
-                response.status()
-            )));
+        // Retry with exponential backoff on 429/5xx
+        let mut last_err = String::new();
+        let mut bytes_result = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
+                tokio::time::sleep(delay).await;
+                info!(slug, attempt, "Retrying ClawHub download");
+            }
+            match self
+                .client
+                .get(&url)
+                .header("User-Agent", "OpenFang/0.1")
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(b) => {
+                        bytes_result = Some(b);
+                        break;
+                    }
+                    Err(e) => last_err = format!("Failed to read download: {e}"),
+                },
+                Ok(resp) if resp.status().as_u16() == 429 || resp.status().is_server_error() => {
+                    last_err = format!("ClawHub download returned {}", resp.status());
+                }
+                Ok(resp) => {
+                    return Err(SkillError::Network(format!(
+                        "ClawHub download returned {}",
+                        resp.status()
+                    )));
+                }
+                Err(e) => last_err = format!("ClawHub download failed: {e}"),
+            }
         }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| SkillError::Network(format!("Failed to read download: {e}")))?;
+        let bytes = bytes_result
+            .ok_or_else(|| SkillError::Network(format!("{last_err} (after 3 attempts)")))?;
 
         // Step 1: SHA256 of downloaded content
         let sha256 = {
@@ -593,14 +611,25 @@ impl ClawHubClient {
     }
 }
 
-/// Minimal URL-encoding for query parameters.
+/// RFC 3986 percent-encoding for query parameters.
+/// Unreserved characters pass through, space becomes `+`, everything else is `%XX`.
 fn urlencoded(s: &str) -> String {
-    s.replace(' ', "+")
-        .replace('&', "%26")
-        .replace('=', "%3D")
-        .replace('?', "%3F")
-        .replace('#', "%23")
-        .replace('/', "%2F")
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    let mut result = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(b as char);
+            }
+            b' ' => result.push('+'),
+            _ => {
+                result.push('%');
+                result.push(HEX_UPPER[(b >> 4) as usize] as char);
+                result.push(HEX_UPPER[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    result
 }
 
 /// Check if a binary is available on PATH.
@@ -786,6 +815,11 @@ mod tests {
         assert_eq!(urlencoded("hello world"), "hello+world");
         assert_eq!(urlencoded("a&b=c"), "a%26b%3Dc");
         assert_eq!(urlencoded("path/to#frag"), "path%2Fto%23frag");
+        // Previously missed characters
+        assert_eq!(urlencoded("100%"), "100%25");
+        assert_eq!(urlencoded("a+b"), "a%2Bb");
+        // Unreserved chars pass through
+        assert_eq!(urlencoded("hello-world_2.0~test"), "hello-world_2.0~test");
     }
 
     #[test]

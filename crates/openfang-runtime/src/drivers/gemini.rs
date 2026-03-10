@@ -76,7 +76,11 @@ enum GeminiPart {
         function_call: GeminiFunctionCallData,
         /// Thought signature from Gemini 2.5+ thinking models.
         /// Must be round-tripped verbatim in the next request turn.
-        #[serde(rename = "thoughtSignature", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "thoughtSignature",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         thought_signature: Option<String>,
     },
     FunctionResponse {
@@ -96,6 +100,13 @@ struct GeminiInlineData {
 struct GeminiFunctionCallData {
     name: String,
     args: serde_json::Value,
+    /// Gemini 2.5+ thinking models return this on functionCall parts.
+    #[serde(
+        rename = "thoughtSignature",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -165,8 +176,30 @@ struct GeminiErrorResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GeminiErrorDetail {
     message: String,
+    #[serde(default)]
+    code: Option<u16>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Parse a Gemini error response body, handling multiple Google API error formats.
+fn parse_gemini_error(body: &str) -> String {
+    if let Ok(e) = serde_json::from_str::<GeminiErrorResponse>(body) {
+        let mut msg = e.error.message;
+        if let Some(status) = e.error.status {
+            msg = format!("{status}: {msg}");
+        }
+        return msg;
+    }
+    // Google sometimes returns bare JSON arrays or HTML error pages
+    if body.starts_with('<') {
+        return "Google API returned an HTML error page — check your API key and model name"
+            .to_string();
+    }
+    body.to_string()
 }
 
 // ── Message conversion ─────────────────────────────────────────────────
@@ -201,11 +234,17 @@ fn convert_messages(
                         ContentBlock::Text { text } => {
                             parts.push(GeminiPart::Text { text: text.clone() });
                         }
-                        ContentBlock::ToolUse { name, input, thought_signature, .. } => {
+                        ContentBlock::ToolUse {
+                            name,
+                            input,
+                            thought_signature,
+                            ..
+                        } => {
                             parts.push(GeminiPart::FunctionCall {
                                 function_call: GeminiFunctionCallData {
                                     name: name.clone(),
                                     args: input.clone(),
+                                    thought_signature: None,
                                 },
                                 thought_signature: thought_signature.clone(),
                             });
@@ -319,7 +358,10 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
                             content.push(ContentBlock::Text { text });
                         }
                     }
-                    GeminiPart::FunctionCall { function_call, thought_signature } => {
+                    GeminiPart::FunctionCall {
+                        function_call,
+                        thought_signature,
+                    } => {
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
                         content.push(ContentBlock::ToolUse {
                             id: id.clone(),
@@ -340,10 +382,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
             }
         }
         None => {
-            let reason = candidate
-                .finish_reason
-                .as_deref()
-                .unwrap_or("unknown");
+            let reason = candidate.finish_reason.as_deref().unwrap_or("unknown");
             warn!(finish_reason = %reason, "Gemini returned candidate with no content");
             return Err(LlmError::Parse(format!(
                 "Gemini returned empty response (finish_reason: {reason})"
@@ -399,8 +438,10 @@ impl LlmDriver for GeminiDriver {
         let max_retries = 3;
         for attempt in 0..=max_retries {
             let url = format!(
-                "{}/v1beta/models/{}:generateContent",
-                self.base_url, request.model
+                "{}/v1beta/models/{}:generateContent?key={}",
+                self.base_url,
+                request.model,
+                self.api_key.as_str()
             );
             debug!(url = %url, attempt, "Sending Gemini API request");
             let resp = self
@@ -435,9 +476,13 @@ impl LlmDriver for GeminiDriver {
 
             if !resp.status().is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                let message = serde_json::from_str::<GeminiErrorResponse>(&body)
-                    .map(|e| e.error.message)
-                    .unwrap_or(body);
+                let message = parse_gemini_error(&body);
+                if status == 401 || status == 403 {
+                    return Err(LlmError::AuthenticationFailed(message));
+                }
+                if status == 404 {
+                    return Err(LlmError::ModelNotFound(message));
+                }
                 return Err(LlmError::Api { status, message });
             }
 
@@ -478,8 +523,10 @@ impl LlmDriver for GeminiDriver {
         let max_retries = 3;
         for attempt in 0..=max_retries {
             let url = format!(
-                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-                self.base_url, request.model
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+                self.base_url,
+                request.model,
+                self.api_key.as_str()
             );
             debug!(url = %url, attempt, "Sending Gemini streaming request");
 
@@ -518,9 +565,13 @@ impl LlmDriver for GeminiDriver {
 
             if !resp.status().is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                let message = serde_json::from_str::<GeminiErrorResponse>(&body)
-                    .map(|e| e.error.message)
-                    .unwrap_or(body);
+                let message = parse_gemini_error(&body);
+                if status == 401 || status == 403 {
+                    return Err(LlmError::AuthenticationFailed(message));
+                }
+                if status == 404 {
+                    return Err(LlmError::ModelNotFound(message));
+                }
                 return Err(LlmError::Api { status, message });
             }
 
@@ -579,7 +630,10 @@ impl LlmDriver for GeminiDriver {
                                                 .await;
                                         }
                                     }
-                                    GeminiPart::FunctionCall { function_call, thought_signature } => {
+                                    GeminiPart::FunctionCall {
+                                        function_call,
+                                        thought_signature,
+                                    } => {
                                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
                                         let _ = tx
                                             .send(StreamEvent::ToolUseStart {

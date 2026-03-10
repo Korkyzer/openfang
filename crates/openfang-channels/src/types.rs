@@ -234,6 +234,41 @@ pub trait ChannelAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Send a placeholder message and return its ID for later editing.
+    ///
+    /// Channels that support message editing (Discord, Slack, Telegram) can
+    /// override this to send a "Working..." message that gets replaced with the
+    /// actual response. Returns `None` if not supported (default).
+    async fn send_placeholder(
+        &self,
+        _user: &ChannelUser,
+        _text: &str,
+        _thread_id: Option<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        Ok(None)
+    }
+
+    /// Delete a previously sent message by ID (optional - default no-op).
+    async fn delete_message(
+        &self,
+        _user: &ChannelUser,
+        _message_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    /// Edit a previously sent message by ID.
+    ///
+    /// Default: no-op. Override in adapters that support message editing.
+    async fn edit_message(
+        &self,
+        _user: &ChannelUser,
+        _message_id: &str,
+        _content: ChannelContent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
     /// Send a lifecycle reaction to a message (optional — default no-op).
     async fn send_reaction(
         &self,

@@ -14,10 +14,10 @@ pub mod openai;
 use crate::llm_driver::{DriverConfig, LlmDriver, LlmError};
 use openfang_types::model_catalog::{
     AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
-    FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
-    OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
+    FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, LEMONADE_BASE_URL,
+    LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL,
+    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
+    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
     ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
@@ -89,6 +89,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "LMSTUDIO_API_KEY",
             key_required: false,
         }),
+        "lemonade" => Some(ProviderDefaults {
+            base_url: LEMONADE_BASE_URL,
+            api_key_env: "LEMONADE_API_KEY",
+            key_required: false,
+        }),
         "perplexity" => Some(ProviderDefaults {
             base_url: PERPLEXITY_BASE_URL,
             api_key_env: "PERPLEXITY_API_KEY",
@@ -149,7 +154,7 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "MOONSHOT_API_KEY",
             key_required: true,
         }),
-        "qwen" | "dashscope" => Some(ProviderDefaults {
+        "qwen" | "dashscope" | "model_studio" => Some(ProviderDefaults {
             base_url: QWEN_BASE_URL,
             api_key_env: "DASHSCOPE_API_KEY",
             key_required: true,
@@ -192,6 +197,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
         "volcengine_coding" => Some(ProviderDefaults {
             base_url: VOLCENGINE_CODING_BASE_URL,
             api_key_env: "VOLCENGINE_API_KEY",
+            key_required: true,
+        }),
+        "venice" => Some(ProviderDefaults {
+            base_url: VENICE_BASE_URL,
+            api_key_env: "VENICE_API_KEY",
             key_required: true,
         }),
         _ => None,
@@ -267,9 +277,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             .or_else(crate::model_catalog::read_codex_credential)
             .ok_or_else(|| {
-                LlmError::MissingApiKey(
-                    "Set OPENAI_API_KEY or install Codex CLI".to_string(),
-                )
+                LlmError::MissingApiKey("Set OPENAI_API_KEY or install Codex CLI".to_string())
             })?;
         let base_url = config
             .base_url
@@ -278,10 +286,12 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
     }
 
-    // Claude Code CLI — subprocess-based, no API key needed
+    // Claude Code CLI is disabled in OpenFang runtime.
+    // Claude-backed tasks should go through Anthropic or the meta-router, not a local CLI subprocess.
     if provider == "claude-code" {
-        let cli_path = config.base_url.clone();
-        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(cli_path)));
+        return Err(LlmError::Http(
+            "The claude-code provider is disabled. Use the anthropic provider or the meta-router instead.".to_string(),
+        ));
     }
 
     // GitHub Copilot — wraps OpenAI-compatible driver with automatic token exchange.
@@ -345,10 +355,66 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
              cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
-             codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
+             venice, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
+}
+
+/// Detect the first available provider by scanning environment variables.
+///
+/// Returns `(provider, model, api_key_env)` for the first provider that has a
+/// configured API key, checked in a user-friendly priority order.
+pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'static str)> {
+    // Priority: popular cloud providers first, then niche, then local
+    const PROBE_ORDER: &[(&str, &str, &str)] = &[
+        ("openai", "gpt-4o", "OPENAI_API_KEY"),
+        ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+        ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
+        ("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY"),
+        ("deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),
+        (
+            "openrouter",
+            "openrouter/anthropic/claude-sonnet-4",
+            "OPENROUTER_API_KEY",
+        ),
+        ("mistral", "mistral-large-latest", "MISTRAL_API_KEY"),
+        (
+            "together",
+            "meta-llama/Llama-3-70b-chat-hf",
+            "TOGETHER_API_KEY",
+        ),
+        (
+            "fireworks",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "FIREWORKS_API_KEY",
+        ),
+        ("xai", "grok-2", "XAI_API_KEY"),
+        (
+            "perplexity",
+            "llama-3.1-sonar-large-128k-online",
+            "PERPLEXITY_API_KEY",
+        ),
+        ("cohere", "command-r-plus", "COHERE_API_KEY"),
+    ];
+    for &(provider, model, env_var) in PROBE_ORDER {
+        if std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            return Some((provider, model, env_var));
+        }
+    }
+    // Also check GOOGLE_API_KEY as alias for Gemini
+    if std::env::var("GOOGLE_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return Some(("gemini", "gemini-2.5-flash", "GOOGLE_API_KEY"));
+    }
+    None
 }
 
 /// List all known provider names.
@@ -382,6 +448,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "zhipu_coding",
         "qianfan",
         "volcengine",
+        "venice",
         "codex",
         "claude-code",
     ]
@@ -480,7 +547,7 @@ mod tests {
         assert!(providers.contains(&"volcengine"));
         assert!(providers.contains(&"codex"));
         assert!(providers.contains(&"claude-code"));
-        assert_eq!(providers.len(), 30);
+        assert_eq!(providers.len(), 31);
     }
 
     #[test]

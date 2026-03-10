@@ -72,7 +72,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         name: "openrouter",
         display: "OpenRouter",
         env_var: "OPENROUTER_API_KEY",
-        default_model: "openrouter/auto",
+        default_model: "openrouter/anthropic/claude-sonnet-4",
         needs_key: true,
         hint: "",
     },
@@ -171,6 +171,14 @@ const PROVIDERS: &[ProviderInfo] = &[
         default_model: "meta/meta-llama-3-70b-instruct",
         needs_key: true,
         hint: "",
+    },
+    ProviderInfo {
+        name: "venice",
+        display: "Venice.ai",
+        env_var: "VENICE_API_KEY",
+        default_model: "venice-uncensored",
+        needs_key: true,
+        hint: "uncensored",
     },
     ProviderInfo {
         name: "ai21",
@@ -556,6 +564,13 @@ fn tier_label(tier: ModelTier) -> &'static str {
 // ── Entry point ────────────────────────────────────────────────────────────
 
 pub fn run() -> InitResult {
+    // Guard against non-TTY environments (Docker, piped, CI/CD)
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        return InitResult::Cancelled;
+    }
+
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
@@ -916,7 +931,9 @@ fn handle_migration_key(
                     let target_dir = if let Ok(h) = std::env::var("OPENFANG_HOME") {
                         PathBuf::from(h)
                     } else {
-                        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".openfang")
+                        dirs::home_dir()
+                            .unwrap_or_else(|| PathBuf::from("."))
+                            .join(".openfang")
                     };
                     let tx = migrate_tx.clone();
                     std::thread::spawn(move || {
@@ -2006,11 +2023,7 @@ fn draw_routing_pick(f: &mut Frame, area: Rect, state: &mut State, tier: usize) 
                 .split('/')
                 .next_back()
                 .unwrap_or(&state.routing_models[t]);
-            let display = if short.len() > 14 {
-                &short[..14]
-            } else {
-                short
-            };
+            let display = openfang_types::truncate_str(short, 14);
             summary_spans.push(Span::styled(
                 format!("{name}:{display}"),
                 Style::default().fg(*c),
