@@ -639,12 +639,19 @@ async fn parse_discord_message(
     let channel_id = d["channel_id"].as_str()?;
     let message_id = d["id"].as_str().unwrap_or("0");
     let username = author["username"].as_str().unwrap_or("Unknown");
+    let global_name = author["global_name"]
+        .as_str()
+        .filter(|name| !name.trim().is_empty());
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
-    let display_name = if discriminator == "0" {
-        username.to_string()
-    } else {
-        format!("{username}#{discriminator}")
-    };
+    let display_name = global_name
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if discriminator == "0" {
+                username.to_string()
+            } else {
+                format!("{username}#{discriminator}")
+            }
+        });
 
     let timestamp = d["timestamp"]
         .as_str()
@@ -701,6 +708,16 @@ async fn parse_discord_message(
     let mut metadata = HashMap::new();
     metadata.insert("sender_id".to_string(), serde_json::json!(author_id));
     metadata.insert("sender_username".to_string(), serde_json::json!(username));
+    metadata.insert(
+        "sender_display_name".to_string(),
+        serde_json::json!(display_name.clone()),
+    );
+    if let Some(global_name) = global_name {
+        metadata.insert(
+            "sender_global_name".to_string(),
+            serde_json::json!(global_name),
+        );
+    }
     if was_mentioned {
         metadata.insert("was_mentioned".to_string(), serde_json::json!(true));
     }

@@ -822,10 +822,37 @@ async fn maybe_handle_discord_admin_command(
     let sender_username = message
         .metadata
         .get("sender_username")
-        .and_then(|value| value.as_str())?;
-    if sender_username != "Asa" {
+        .and_then(|value| value.as_str());
+    let sender_display_name = message
+        .metadata
+        .get("sender_display_name")
+        .and_then(|value| value.as_str());
+    let sender_global_name = message
+        .metadata
+        .get("sender_global_name")
+        .and_then(|value| value.as_str());
+    let is_authorized_sender = [sender_username, sender_display_name, sender_global_name]
+        .into_iter()
+        .flatten()
+        .any(|name| name.eq_ignore_ascii_case("Asa"));
+    if !is_authorized_sender {
+        info!(
+            command = command,
+            sender_username = sender_username.unwrap_or(""),
+            sender_display_name = sender_display_name.unwrap_or(""),
+            sender_global_name = sender_global_name.unwrap_or(""),
+            "Ignoring Discord admin command from unauthorized sender"
+        );
         return None;
     }
+
+    info!(
+        command = command,
+        sender_username = sender_username.unwrap_or(""),
+        sender_display_name = sender_display_name.unwrap_or(""),
+        sender_global_name = sender_global_name.unwrap_or(""),
+        "Handling Discord admin command"
+    );
 
     Some(match command {
         "status" => handle.heartbeat_status_text().await,
