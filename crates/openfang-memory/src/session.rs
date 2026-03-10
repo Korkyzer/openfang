@@ -9,6 +9,64 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// A single full-text search hit across indexed session messages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSearchResult {
+    pub agent_id: String,
+    pub session_id: String,
+    pub role: String,
+    pub snippet: String,
+    pub rank: f64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionFtsEntry {
+    pub role: String,
+    pub content: String,
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+fn searchable_message_text(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.trim().to_string(),
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.trim().to_string()),
+                ContentBlock::ToolResult { content, .. } => Some(content.trim().to_string()),
+                ContentBlock::Thinking { thinking } => Some(thinking.trim().to_string()),
+                ContentBlock::Image { media_type, .. } => Some(format!("[image: {media_type}]")),
+                ContentBlock::ToolUse { .. } | ContentBlock::Unknown => None,
+            })
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+pub(crate) fn session_search_entries(messages: &[Message]) -> Vec<SessionFtsEntry> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let content = searchable_message_text(&message.content);
+            if content.is_empty() {
+                return None;
+            }
+            Some(SessionFtsEntry {
+                role: role_name(message.role).to_string(),
+                content,
+            })
+        })
+        .collect()
+}
+
 /// A conversation session with message history.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -31,6 +89,43 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    fn reindex_session_fts(
+        conn: &Connection,
+        session: &Session,
+        created_at: &str,
+    ) -> OpenFangResult<()> {
+        conn.execute(
+            "DELETE FROM session_fts WHERE session_id = ?1",
+            rusqlite::params![session.id.0.to_string()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let entries = session_search_entries(&session.messages);
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO session_fts (content, agent_id, session_id, role, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        for entry in entries {
+            stmt.execute(rusqlite::params![
+                entry.content,
+                session.agent_id.0.to_string(),
+                session.id.0.to_string(),
+                entry.role,
+                created_at,
+            ])
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     /// Create a new session store wrapping the given connection.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
@@ -97,6 +192,15 @@ impl SessionStore {
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let created_at: String = conn
+            .query_row(
+                "SELECT created_at FROM sessions WHERE id = ?1",
+                rusqlite::params![session.id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Self::reindex_session_fts(&conn, session, &created_at)?;
         Ok(())
     }
 
@@ -108,6 +212,11 @@ impl SessionStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         conn.execute(
             "DELETE FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id.0.to_string()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM session_fts WHERE session_id = ?1",
             rusqlite::params![session_id.0.to_string()],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -125,7 +234,54 @@ impl SessionStore {
             rusqlite::params![agent_id.0.to_string()],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM session_fts WHERE agent_id = ?1",
+            rusqlite::params![agent_id.0.to_string()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    pub fn session_search(
+        &self,
+        query: &str,
+        agent_id: Option<&str>,
+        limit: u32,
+    ) -> OpenFangResult<Vec<SessionSearchResult>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, session_id, role,
+                        snippet(session_fts, 0, '<b>', '</b>', '...', 32) AS snippet,
+                        rank
+                 FROM session_fts
+                 WHERE content MATCH ?1
+                   AND (agent_id = ?2 OR ?2 IS NULL)
+                 ORDER BY rank
+                 LIMIT ?3",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![query, agent_id, limit], |row| {
+                Ok(SessionSearchResult {
+                    agent_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    snippet: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    rank: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
+                })
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+        }
+        Ok(results)
     }
 
     /// Delete the canonical (cross-channel) session for an agent.
@@ -807,5 +963,40 @@ mod tests {
         assert_eq!(line2["role"], "assistant");
         assert_eq!(line2["content"], "Hi there!");
         assert!(line2.get("tool_use").is_none());
+    }
+
+    #[test]
+    fn test_session_search_indexes_messages() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let mut session = store.create_session(agent_id).unwrap();
+        session.messages.push(Message::user("Need rust sqlite search"));
+        session
+            .messages
+            .push(Message::assistant("Use FTS5 for fast lookup"));
+        store.save_session(&session).unwrap();
+
+        let results = store.session_search("sqlite", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, session.id.0.to_string());
+        assert_eq!(results[0].role, "user");
+        assert!(results[0].snippet.contains("sqlite"));
+    }
+
+    #[test]
+    fn test_session_search_reindexes_updated_session() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let mut session = store.create_session(agent_id).unwrap();
+        session.messages.push(Message::user("alpha"));
+        store.save_session(&session).unwrap();
+        assert_eq!(store.session_search("alpha", None, 10).unwrap().len(), 1);
+
+        session.messages.clear();
+        session.messages.push(Message::user("beta"));
+        store.save_session(&session).unwrap();
+
+        assert!(store.session_search("alpha", None, 10).unwrap().is_empty());
+        assert_eq!(store.session_search("beta", None, 10).unwrap().len(), 1);
     }
 }

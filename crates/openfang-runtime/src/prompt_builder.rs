@@ -469,7 +469,9 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "shell_exec" | "shell_background" => "Shell",
 
-        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" => "Memory",
+        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" | "session_search" => {
+            "Memory"
+        }
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" => "Agents",
 
@@ -527,6 +529,7 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_recall" => "search memory for relevant context",
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
+        "session_search" => "search conversation history across saved sessions",
 
         // Agents
         "agent_send" => "send a message to another agent",

@@ -7,7 +7,7 @@ use crate::consolidation::ConsolidationEngine;
 use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
 use crate::semantic::SemanticStore;
-use crate::session::{Session, SessionStore};
+use crate::session::{Session, SessionSearchResult, SessionStore};
 use crate::structured::StructuredStore;
 use crate::usage::UsageStore;
 
@@ -195,6 +195,16 @@ impl MemorySubstrate {
     /// List all sessions for a specific agent.
     pub fn list_agent_sessions(&self, agent_id: AgentId) -> OpenFangResult<Vec<serde_json::Value>> {
         self.sessions.list_agent_sessions(agent_id)
+    }
+
+    /// Search indexed session message content.
+    pub fn session_search(
+        &self,
+        query: &str,
+        agent_id: Option<&str>,
+        limit: u32,
+    ) -> OpenFangResult<Vec<SessionSearchResult>> {
+        self.sessions.session_search(query, agent_id, limit)
     }
 
     /// Create a new session with an optional label.

@@ -13,7 +13,7 @@ use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
 
-use openfang_memory::MemorySubstrate;
+use openfang_memory::{session::SessionSearchResult, MemorySubstrate};
 use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
 };
@@ -33,6 +33,7 @@ use openfang_types::config::KernelConfig;
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
+use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
@@ -2582,6 +2583,86 @@ impl OpenFangKernel {
         );
     }
 
+    async fn summarize_session_search_results(
+        &self,
+        results: &[SessionSearchResult],
+        requester_agent_id: Option<&str>,
+    ) -> Option<String> {
+        if results.is_empty() {
+            return None;
+        }
+
+        let (driver, model) = requester_agent_id
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(AgentId)
+            .and_then(|agent_id| self.registry.get(agent_id))
+            .and_then(|entry| {
+                self.resolve_driver(&entry.manifest)
+                    .ok()
+                    .map(|driver| (driver, entry.manifest.model.model.clone()))
+            })
+            .unwrap_or_else(|| {
+                (
+                    Arc::clone(&self.default_driver),
+                    self.config.default_model.model.clone(),
+                )
+            });
+
+        let prompt = results
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(index, result)| {
+                format!(
+                    "Result {}:\nAgent ID: {}\nSession ID: {}\nRole: {}\nSnippet: {}",
+                    index + 1,
+                    result.agent_id,
+                    result.session_id,
+                    result.role,
+                    result.snippet
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let request = CompletionRequest {
+            model,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: format!(
+                        "Condense these session search hits into a brief, factual context summary. \
+                         Keep it under 5 sentences. Mention recurring themes and likely user intent. \
+                         Output only the summary.\n\n{prompt}"
+                    ),
+                }]),
+            }],
+            tools: vec![],
+            max_tokens: 180,
+            temperature: 0.2,
+            system: Some(
+                "You summarize search results for an agent runtime. Be concise and factual."
+                    .to_string(),
+            ),
+            thinking: None,
+        };
+
+        match driver.complete(request).await {
+            Ok(response) => {
+                let summary = response.text().trim().to_string();
+                if summary.is_empty() {
+                    None
+                } else {
+                    Some(summary)
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "Session search summarization failed");
+                None
+            }
+        }
+    }
+
     /// Switch an agent's model.
     pub fn set_agent_model(&self, agent_id: AgentId, model: &str) -> KernelResult<()> {
         // Resolve provider from model catalog so switching models also switches provider
@@ -4978,6 +5059,23 @@ impl KernelHandle for OpenFangKernel {
         self.memory
             .structured_get(agent_id, key)
             .map_err(|e| format!("Memory recall failed: {e}"))
+    }
+
+    async fn session_search(
+        &self,
+        query: &str,
+        agent_id: Option<&str>,
+        limit: u32,
+        requester_agent_id: Option<&str>,
+    ) -> Result<(Option<String>, Vec<SessionSearchResult>), String> {
+        let results = self
+            .memory
+            .session_search(query, agent_id, limit)
+            .map_err(|e| format!("Session search failed: {e}"))?;
+        let summary = self
+            .summarize_session_search_results(&results, requester_agent_id)
+            .await;
+        Ok((summary, results))
     }
 
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {

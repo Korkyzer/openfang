@@ -2,10 +2,12 @@
 //!
 //! Creates all tables needed by the memory substrate on first boot.
 
+use crate::session::session_search_entries;
+use openfang_types::message::Message;
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +43,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -328,6 +334,64 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn backfill_session_fts(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT id, agent_id, messages, created_at FROM sessions")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    conn.execute("DELETE FROM session_fts", [])?;
+
+    let mut insert = conn.prepare(
+        "INSERT INTO session_fts (content, agent_id, session_id, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+
+    for (session_id, agent_id, messages_blob, created_at) in rows {
+        let messages: Vec<Message> = rmp_serde::from_slice(&messages_blob)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        for entry in session_search_entries(&messages) {
+            insert.execute(rusqlite::params![
+                entry.content,
+                agent_id,
+                session_id,
+                entry.role,
+                created_at,
+            ])?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Version 9: Add FTS index over session message content.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(
+            content,
+            agent_id UNINDEXED,
+            session_id UNINDEXED,
+            role UNINDEXED,
+            created_at UNINDEXED
+        );
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Add FTS5 index for cross-session search');
+        ",
+    )?;
+    backfill_session_fts(conn)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +423,21 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap(); // Should not error
+    }
+
+    #[test]
+    fn test_migration_creates_session_fts() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(exists, 1);
     }
 }

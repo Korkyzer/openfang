@@ -48,6 +48,15 @@ pub trait KernelHandle: Send + Sync {
     /// Recall a value from shared memory.
     fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String>;
 
+    /// Search indexed session content across one or all agents.
+    async fn session_search(
+        &self,
+        query: &str,
+        agent_id: Option<&str>,
+        limit: u32,
+        requester_agent_id: Option<&str>,
+    ) -> Result<(Option<String>, Vec<openfang_memory::session::SessionSearchResult>), String>;
+
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;
 

@@ -285,6 +285,7 @@ pub async fn execute_tool(
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
+        "session_search" => tool_session_search(input, kernel, caller_agent_id).await,
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -674,6 +675,19 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "key": { "type": "string", "description": "The storage key to recall" }
                 },
                 "required": ["key"]
+            }),
+        },
+        ToolDefinition {
+            name: "session_search".to_string(),
+            description: "Search indexed conversation history across sessions, optionally scoped to a single agent.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "FTS5 query text to search for" },
+                    "agent_id": { "type": "string", "description": "Optional agent UUID to scope the search" },
+                    "limit": { "type": "integer", "description": "Maximum number of results to return (default: 10)" }
+                },
+                "required": ["query"]
             }),
         },
         // --- Collaboration tools ---
@@ -1673,6 +1687,56 @@ fn tool_memory_recall(
         Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
         None => Ok(format!("No value found for key '{key}'.")),
     }
+}
+
+async fn tool_session_search(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let query = input["query"].as_str().ok_or("Missing 'query' parameter")?;
+    let agent_filter = input["agent_id"].as_str();
+    let limit = input["limit"].as_u64().unwrap_or(10).clamp(1, 50) as u32;
+    let (summary, results) = kh
+        .session_search(query, agent_filter, limit, caller_agent_id)
+        .await?;
+
+    if results.is_empty() {
+        return Ok(format!("No session matches found for '{query}'."));
+    }
+
+    let agent_names = kh
+        .list_agents()
+        .into_iter()
+        .map(|agent| (agent.id, agent.name))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut output = format!("Found {} session match(es) for `{query}`.\n", results.len());
+    if let Some(summary) = summary.filter(|text| !text.trim().is_empty()) {
+        output.push_str("\n**Context Summary**\n");
+        output.push_str(summary.trim());
+        output.push('\n');
+    }
+
+    output.push_str("\n**Results**\n");
+    for (index, result) in results.iter().enumerate() {
+        let agent_name = agent_names
+            .get(&result.agent_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        output.push_str(&format!(
+            "{}. `{}` | {} (`{}`) | {}\n{}\n",
+            index + 1,
+            result.session_id,
+            agent_name,
+            result.agent_id,
+            result.role,
+            result.snippet
+        ));
+    }
+
+    Ok(output.trim_end().to_string())
 }
 
 // ---------------------------------------------------------------------------
