@@ -1345,7 +1345,6 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
     }
 }
 
-
 fn validate_workspace_filename(filename: &str) -> Result<&str, String> {
     if WORKSPACE_FILE_ALLOWLIST.contains(&filename) {
         Ok(filename)
@@ -1385,7 +1384,9 @@ fn validate_git_repo_path(repo_path: &str) -> Result<PathBuf, String> {
     }
     let repo = PathBuf::from(repo_path);
     if !repo.join(".git").exists() {
-        return Err(format!("Repository '{repo_path}' does not look like a Git repository"));
+        return Err(format!(
+            "Repository '{repo_path}' does not look like a Git repository"
+        ));
     }
     Ok(repo)
 }
@@ -1466,7 +1467,6 @@ async fn tool_file_list(
     files.sort();
     Ok(files.join("\n"))
 }
-
 
 async fn tool_workspace_read(
     input: &serde_json::Value,
@@ -1753,7 +1753,6 @@ async fn tool_shell_exec(
     }
 }
 
-
 async fn tool_git_log(input: &serde_json::Value) -> Result<String, String> {
     let repo_path = input["repo_path"]
         .as_str()
@@ -1763,8 +1762,15 @@ async fn tool_git_log(input: &serde_json::Value) -> Result<String, String> {
         .unwrap_or(DEFAULT_GIT_LOG_LIMIT)
         .clamp(1, 50);
     let repo = validate_git_repo_path(repo_path)?;
-    run_git_command(&repo, &["log".to_string(), "--oneline".to_string(), format!("-{limit}")])
-        .await
+    run_git_command(
+        &repo,
+        &[
+            "log".to_string(),
+            "--oneline".to_string(),
+            format!("-{limit}"),
+        ],
+    )
+    .await
 }
 
 async fn tool_git_summary(input: &serde_json::Value) -> Result<String, String> {
@@ -1772,15 +1778,25 @@ async fn tool_git_summary(input: &serde_json::Value) -> Result<String, String> {
         .as_str()
         .ok_or("Missing 'repo_path' parameter")?;
     let repo = validate_git_repo_path(repo_path)?;
-    let status = run_git_command(&repo, &["status".to_string(), "--short".to_string(), "--branch".to_string()]).await?;
+    let status = run_git_command(
+        &repo,
+        &[
+            "status".to_string(),
+            "--short".to_string(),
+            "--branch".to_string(),
+        ],
+    )
+    .await?;
     let log = run_git_command(
         &repo,
         &["log".to_string(), "--oneline".to_string(), "-5".to_string()],
     )
     .await?;
-    Ok(format!("{status}
+    Ok(format!(
+        "{status}
 
-{log}"))
+{log}"
+    ))
 }
 
 // ---------------------------------------------------------------------------

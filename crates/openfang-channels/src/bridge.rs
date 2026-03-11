@@ -219,7 +219,6 @@ pub trait ChannelBridgeHandle: Send + Sync {
         "Disk status is not available.".to_string()
     }
 
-
     /// Run the host heartbeat status command and return the output.
     async fn heartbeat_status_text(&self) -> String {
         "Heartbeat status is not available.".to_string()

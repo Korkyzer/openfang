@@ -131,7 +131,6 @@ async fn run_command_capture(mut command: Command) -> Result<String, String> {
     }
 }
 
-
 fn read_admin_api_token(home_dir: &std::path::Path, fallback: &str) -> String {
     let config_path = home_dir.join("config.toml");
     match std::fs::read_to_string(config_path) {
@@ -211,8 +210,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         let result = join_handle
             .await
             .map_err(|e| format!("join error: {e}"))?
-            .map_err(|e| format!("{e}"))?
-;
+            .map_err(|e| format!("{e}"))?;
         Ok(result.response)
     }
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
@@ -964,7 +962,6 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             Err(e) => format!("Disk status failed: {e}"),
         }
     }
-
 
     async fn heartbeat_status_text(&self) -> String {
         let mut command = Command::new("bash");
@@ -1849,9 +1846,7 @@ pub async fn start_channel_bridge_with_config(
                 if let Some(agent_id) = agent_id {
                     // In Discord, sender.platform_id = channel_id, so direct routes work
                     router.set_direct_route(channel_key.clone(), channel_id.clone(), agent_id);
-                    info!(
-                        "Discord channel {channel_id} -> agent {agent_name} ({agent_id})"
-                    );
+                    info!("Discord channel {channel_id} -> agent {agent_name} ({agent_id})");
                 }
             }
         }

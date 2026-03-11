@@ -498,6 +498,38 @@ fn gethostname() -> Option<String> {
 }
 
 impl OpenFangKernel {
+    fn agent_manifest_path(&self, agent_name: &str) -> PathBuf {
+        self.config
+            .home_dir
+            .join("agents")
+            .join(agent_name)
+            .join("agent.toml")
+    }
+
+    fn persist_manifest_to_disk(&self, manifest: &AgentManifest) -> KernelResult<()> {
+        let manifest_path = self.agent_manifest_path(&manifest.name);
+        if let Some(parent) = manifest_path.parent() {
+            std::fs::create_dir_all(parent).map_err(OpenFangError::from)?;
+        }
+
+        let toml = toml::to_string_pretty(manifest)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        std::fs::write(&manifest_path, toml).map_err(OpenFangError::from)?;
+        Ok(())
+    }
+
+    pub fn persist_agent_config(&self, agent_id: AgentId) -> KernelResult<()> {
+        let entry = self
+            .registry
+            .get(agent_id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(agent_id.to_string()))?;
+        self.memory
+            .save_agent(&entry)
+            .map_err(KernelError::OpenFang)?;
+        self.persist_manifest_to_disk(&entry.manifest)?;
+        Ok(())
+    }
+
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
         let config = load_config(config_path);
@@ -1006,17 +1038,8 @@ impl OpenFangKernel {
                                 ) {
                                     Ok(disk_manifest) => {
                                         // Compare key fields to detect changes
-                                        let changed = disk_manifest.name != entry.manifest.name
-                                            || disk_manifest.description
-                                                != entry.manifest.description
-                                            || disk_manifest.model.system_prompt
-                                                != entry.manifest.model.system_prompt
-                                            || disk_manifest.model.provider
-                                                != entry.manifest.model.provider
-                                            || disk_manifest.model.model
-                                                != entry.manifest.model.model
-                                            || disk_manifest.capabilities.tools
-                                                != entry.manifest.capabilities.tools;
+                                        let changed = serde_json::to_value(&disk_manifest).ok()
+                                            != serde_json::to_value(&entry.manifest).ok();
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1289,10 +1312,8 @@ impl OpenFangKernel {
             self.registry.add_child(parent_id, agent_id);
         }
 
-        // Persist agent to SQLite so it survives restarts
-        self.memory
-            .save_agent(&entry)
-            .map_err(KernelError::OpenFang)?;
+        // Persist agent to SQLite and keep the manifest on disk in sync.
+        self.persist_agent_config(agent_id)?;
 
         info!(agent = %name, id = %agent_id, "Agent spawned");
 
@@ -1332,7 +1353,6 @@ impl OpenFangKernel {
         Ok(agent_id)
     }
 
-
     /// Resolve an agent by UUID string or by its registered name.
     pub fn resolve_agent_reference(&self, agent: &str) -> KernelResult<AgentId> {
         if let Ok(id) = agent.parse::<AgentId>() {
@@ -1355,7 +1375,9 @@ impl OpenFangKernel {
                 .set_state(entry.id, AgentState::Suspended)
                 .map_err(KernelError::OpenFang)?;
             if let Some(updated) = self.registry.get(entry.id) {
-                self.memory.save_agent(&updated).map_err(KernelError::OpenFang)?;
+                self.memory
+                    .save_agent(&updated)
+                    .map_err(KernelError::OpenFang)?;
             }
             paused += 1;
         }
@@ -1373,7 +1395,9 @@ impl OpenFangKernel {
                 .set_state(entry.id, AgentState::Running)
                 .map_err(KernelError::OpenFang)?;
             if let Some(updated) = self.registry.get(entry.id) {
-                self.memory.save_agent(&updated).map_err(KernelError::OpenFang)?;
+                self.memory
+                    .save_agent(&updated)
+                    .map_err(KernelError::OpenFang)?;
             }
             resumed += 1;
         }
@@ -1434,9 +1458,10 @@ impl OpenFangKernel {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
         if entry.state == AgentState::Suspended {
-            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(
-                format!("Agent {} is paused", entry.name),
-            )));
+            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(format!(
+                "Agent {} is paused",
+                entry.name
+            ))));
         }
 
         // Dispatch based on module type
@@ -1515,9 +1540,10 @@ impl OpenFangKernel {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
         if entry.state == AgentState::Suspended {
-            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(
-                format!("Agent {} is paused", entry.name),
-            )));
+            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(format!(
+                "Agent {} is paused",
+                entry.name
+            ))));
         }
 
         let is_wasm = entry.manifest.module.starts_with("wasm:");
@@ -2119,12 +2145,17 @@ impl OpenFangKernel {
                 if let Ok(content) = std::fs::read_to_string(&state_path) {
                     if content.starts_with("status: in-progress") {
                         // Check if started > 5 minutes ago
-                        if let Some(started_line) = content.lines().find(|l| l.starts_with("started: ")) {
+                        if let Some(started_line) =
+                            content.lines().find(|l| l.starts_with("started: "))
+                        {
                             let ts_str = started_line.trim_start_matches("started: ");
                             if let Ok(started) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-                                let elapsed = chrono::Utc::now() - started.with_timezone(&chrono::Utc);
+                                let elapsed =
+                                    chrono::Utc::now() - started.with_timezone(&chrono::Utc);
                                 if elapsed > chrono::Duration::minutes(5) {
-                                    if let Some(task_line) = content.lines().find(|l| l.starts_with("task: ")) {
+                                    if let Some(task_line) =
+                                        content.lines().find(|l| l.starts_with("task: "))
+                                    {
                                         let task = task_line.trim_start_matches("task: ");
                                         interrupted_task = Some(task.to_string());
                                         tracing::info!(
@@ -2848,10 +2879,7 @@ impl OpenFangKernel {
             info!(agent_id = %agent_id, model = %normalized_model, "Agent model updated (provider unchanged)");
         }
 
-        // Persist the updated entry
-        if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
-        }
+        self.persist_agent_config(agent_id)?;
 
         // Clear canonical session to prevent memory poisoning from old model's responses
         let _ = self.memory.delete_canonical_session(agent_id);
@@ -2882,9 +2910,7 @@ impl OpenFangKernel {
             .update_skills(agent_id, skills.clone())
             .map_err(KernelError::OpenFang)?;
 
-        if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
-        }
+        self.persist_agent_config(agent_id)?;
 
         info!(agent_id = %agent_id, skills = ?skills, "Agent skills updated");
         Ok(())
@@ -2921,9 +2947,7 @@ impl OpenFangKernel {
             .update_mcp_servers(agent_id, servers.clone())
             .map_err(KernelError::OpenFang)?;
 
-        if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
-        }
+        self.persist_agent_config(agent_id)?;
 
         info!(agent_id = %agent_id, servers = ?servers, "Agent MCP servers updated");
         Ok(())
@@ -2940,9 +2964,7 @@ impl OpenFangKernel {
             .update_tool_filters(agent_id, allowlist.clone(), blocklist.clone())
             .map_err(KernelError::OpenFang)?;
 
-        if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
-        }
+        self.persist_agent_config(agent_id)?;
 
         info!(
             agent_id = %agent_id,
@@ -5133,10 +5155,13 @@ async fn cron_deliver_response(
                     display_name: recipient.clone(),
                     openfang_user: None,
                 };
-                match adapter.send(
-                    &user,
-                    openfang_channels::types::ChannelContent::Text(response.to_string()),
-                ).await {
+                match adapter
+                    .send(
+                        &user,
+                        openfang_channels::types::ChannelContent::Text(response.to_string()),
+                    )
+                    .await
+                {
                     Ok(()) => {
                         tracing::info!(
                             adapter = %adapter_name,
@@ -5181,10 +5206,15 @@ async fn cron_deliver_response(
                                 display_name: recipient.to_string(),
                                 openfang_user: None,
                             };
-                            match adapter.send(
-                                &user,
-                                openfang_channels::types::ChannelContent::Text(response.to_string()),
-                            ).await {
+                            match adapter
+                                .send(
+                                    &user,
+                                    openfang_channels::types::ChannelContent::Text(
+                                        response.to_string(),
+                                    ),
+                                )
+                                .await
+                            {
                                 Ok(()) => {
                                     tracing::info!(
                                         channel = %channel,

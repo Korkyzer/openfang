@@ -754,7 +754,10 @@ mod tests {
             to: Some(String::new()),
         };
         let err = job.validate(0).unwrap_err();
-        assert!(err.contains("recipient must not be empty when specified"), "{err}");
+        assert!(
+            err.contains("recipient must not be empty when specified"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -851,10 +854,9 @@ mod tests {
         }
     }
 
-
     #[test]
     fn serde_accepts_simple_cron_schedule_string() {
-        let back: CronSchedule = serde_json::from_str(""* * * * *"").unwrap();
+        let back: CronSchedule = serde_json::from_str("" * ****"").unwrap();
         match back {
             CronSchedule::Cron { expr, tz } => {
                 assert_eq!(expr, "* * * * *");

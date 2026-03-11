@@ -170,7 +170,11 @@ impl DiscordAdapter {
             return Ok(());
         }
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
-        let clamped = if text.len() > 1990 { &text[..1990] } else { text };
+        let clamped = if text.len() > 1990 {
+            &text[..1990]
+        } else {
+            text
+        };
         let body = serde_json::json!({ "content": clamped });
         let resp = self
             .client
@@ -538,7 +542,8 @@ impl ChannelAdapter for DiscordAdapter {
             ChannelContent::Text(t) => t,
             _ => return Ok(()),
         };
-        self.api_edit_message(&user.platform_id, message_id, &text).await
+        self.api_edit_message(&user.platform_id, message_id, &text)
+            .await
     }
 
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -643,15 +648,13 @@ async fn parse_discord_message(
         .as_str()
         .filter(|name| !name.trim().is_empty());
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
-    let display_name = global_name
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if discriminator == "0" {
-                username.to_string()
-            } else {
-                format!("{username}#{discriminator}")
-            }
-        });
+    let display_name = global_name.map(str::to_string).unwrap_or_else(|| {
+        if discriminator == "0" {
+            username.to_string()
+        } else {
+            format!("{username}#{discriminator}")
+        }
+    });
 
     let timestamp = d["timestamp"]
         .as_str()

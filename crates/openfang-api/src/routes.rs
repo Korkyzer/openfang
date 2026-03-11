@@ -257,7 +257,6 @@ pub async fn resume_all_agents(State(state): State<Arc<AppState>>) -> impl IntoR
     }
 }
 
-
 #[derive(serde::Deserialize)]
 pub struct V1CreateCronJobRequest {
     name: String,
@@ -5065,9 +5064,8 @@ pub async fn update_agent_budget(
         .update_resources(agent_id, hourly, daily, monthly)
     {
         Ok(()) => {
-            // Persist updated entry
-            if let Some(entry) = state.kernel.registry.get(agent_id) {
-                let _ = state.kernel.memory.save_agent(&entry);
+            if let Err(e) = state.kernel.persist_agent_config(agent_id) {
+                tracing::warn!("Failed to persist agent budget update: {e}");
             }
             (
                 StatusCode::OK,
@@ -8396,11 +8394,9 @@ pub async fn patch_agent_config(
         }
     }
 
-    // Persist updated manifest to database so changes survive restart
-    if let Some(entry) = state.kernel.registry.get(agent_id) {
-        if let Err(e) = state.kernel.memory.save_agent(&entry) {
-            tracing::warn!("Failed to persist agent config update: {e}");
-        }
+    // Persist updated manifest so runtime edits and agent.toml stay in sync.
+    if let Err(e) = state.kernel.persist_agent_config(agent_id) {
+        tracing::warn!("Failed to persist agent config update: {e}");
     }
 
     (
@@ -9604,7 +9600,10 @@ pub async fn v1_create_cron_job(
         last_run: None,
         next_run: None,
     };
-    let one_shot = matches!(job.schedule, openfang_types::scheduler::CronSchedule::At { .. });
+    let one_shot = matches!(
+        job.schedule,
+        openfang_types::scheduler::CronSchedule::At { .. }
+    );
 
     match state.kernel.cron_scheduler.add_job(job.clone(), one_shot) {
         Ok(job_id) => {
@@ -9612,15 +9611,8 @@ pub async fn v1_create_cron_job(
                 let _ = state.kernel.cron_scheduler.set_enabled(job_id, false);
             }
             let _ = state.kernel.cron_scheduler.persist();
-            let job = state
-                .kernel
-                .cron_scheduler
-                .get_job(job_id)
-                .unwrap_or(job);
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"job": job})),
-            )
+            let job = state.kernel.cron_scheduler.get_job(job_id).unwrap_or(job);
+            (StatusCode::CREATED, Json(serde_json::json!({"job": job})))
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,

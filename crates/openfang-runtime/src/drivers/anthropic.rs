@@ -27,7 +27,10 @@ impl AnthropicDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(600)).build().expect("HTTP client"),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .expect("HTTP client"),
         }
     }
 }
