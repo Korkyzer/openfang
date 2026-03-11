@@ -25,6 +25,16 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
 
+    /// Post-process a completed agent response before it is delivered to a channel.
+    async fn decorate_response_for_channel(
+        &self,
+        _agent_id: AgentId,
+        _channel_type: &str,
+        response: String,
+    ) -> String {
+        response
+    }
+
     /// Find an agent by name, returning its ID.
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String>;
 
@@ -237,6 +247,11 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Schedule a daemon shutdown after posting confirmation to the channel.
     async fn shutdown_service_text(&self) -> String {
         "Shutting down...".to_string()
+    }
+
+    /// Add or update a manual heartbeat instruction for an agent workspace.
+    async fn heartbeat_update_text(&self, _agent_name: &str, _instruction: &str) -> String {
+        "Heartbeat update is not available.".to_string()
     }
 
     /// Send a message while optionally streaming phase updates.
@@ -749,6 +764,9 @@ async fn dispatch_message(
     // Send to agent and relay response
     match handle.send_message(agent_id, &text).await {
         Ok(response) => {
+            let response = handle
+                .decorate_response_for_channel(agent_id, ct_str, response)
+                .await;
             let formatted = formatter::format_for_channel(&response, output_format);
             if let Some(ref pid) = placeholder_id {
                 if formatted.len() > 1800 {
@@ -810,10 +828,11 @@ async fn maybe_handle_discord_admin_command(
     text: &str,
     handle: &Arc<dyn ChannelBridgeHandle>,
 ) -> Option<String> {
-    let (command, _) = parse_prefixed_command(text, '!')?;
+    let (command, args) = parse_prefixed_command(text, '!')?;
     if !matches!(
         command,
         "status" | "pause" | "resume" | "stop-llm" | "start-llm" | "cleanup" | "disk" | "kill"
+            | "heartbeat-update"
     ) {
         return None;
     }
@@ -861,6 +880,17 @@ async fn maybe_handle_discord_admin_command(
         "cleanup" => handle.disk_cleanup_text().await,
         "disk" => handle.disk_status_text().await,
         "kill" => handle.shutdown_service_text().await,
+        "heartbeat-update" => {
+            let agent_name = match args.first() {
+                Some(name) => name,
+                None => return Some("Usage: !heartbeat-update <agent> <instruction>".to_string()),
+            };
+            let instruction = args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+            if instruction.trim().is_empty() {
+                return Some("Usage: !heartbeat-update <agent> <instruction>".to_string());
+            }
+            handle.heartbeat_update_text(agent_name, instruction.trim()).await
+        }
         _ => unreachable!(),
     })
 }

@@ -37,6 +37,7 @@ use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
+use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
@@ -45,6 +46,8 @@ use tracing::{debug, info, warn};
 /// Stub LLM driver used when no providers are configured.
 /// Returns a helpful error so the dashboard still boots and users can configure providers.
 struct StubDriver;
+
+const HEARTBEAT_REVIEW_THRESHOLD: usize = 20;
 
 #[async_trait]
 impl LlmDriver for StubDriver {
@@ -56,6 +59,37 @@ impl LlmDriver for StubDriver {
                 .to_string(),
         ))
     }
+}
+
+fn background_heartbeat_check_name(message: &str) -> Option<String> {
+    if message.starts_with("[AUTONOMOUS TICK]") {
+        return Some("background:continuous".to_string());
+    }
+
+    if message.starts_with("[SCHEDULED TICK]") {
+        let schedule = message
+            .split("periodic schedule (")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        return Some(match schedule {
+            Some(schedule) => format!("background:periodic:{schedule}"),
+            None => "background:periodic".to_string(),
+        });
+    }
+
+    None
+}
+
+fn heartbeat_triggered_action(result: &AgentLoopResult) -> bool {
+    if result.silent {
+        return false;
+    }
+
+    let trimmed = result.response.trim();
+    !(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NO_REPLY"))
 }
 
 pub struct OpenFangKernel {
@@ -3899,6 +3933,40 @@ impl OpenFangKernel {
                                 {
                                     Ok(Ok(result)) => {
                                         tracing::info!(job = %job_name, "Cron job completed successfully");
+                                        let triggered_action = heartbeat_triggered_action(&result);
+                                        let check_name = job_name.clone();
+                                        match kernel.record_heartbeat_execution(
+                                            agent_id,
+                                            &check_name,
+                                            triggered_action,
+                                        ) {
+                                            Ok(Some(review_message)) => {
+                                                let review_kernel = Arc::clone(&kernel);
+                                                let review_check = check_name.clone();
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = review_kernel
+                                                        .send_message(agent_id, &review_message)
+                                                        .await
+                                                    {
+                                                        tracing::warn!(
+                                                            agent = %agent_id,
+                                                            check_name = %review_check,
+                                                            error = %e,
+                                                            "Heartbeat review prompt failed"
+                                                        );
+                                                    }
+                                                });
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    agent = %agent_id,
+                                                    check_name = %check_name,
+                                                    error = %e,
+                                                    "Failed to record heartbeat execution"
+                                                );
+                                            }
+                                        }
                                         kernel.cron_scheduler.record_success(job_id);
                                         // Deliver response to configured channel
                                         cron_deliver_response(
@@ -4126,6 +4194,86 @@ impl OpenFangKernel {
         info!("Heartbeat monitor started (interval: {}s)", interval_secs);
     }
 
+    fn heartbeat_log_db_path(&self) -> PathBuf {
+        self.config
+            .memory
+            .sqlite_path
+            .clone()
+            .unwrap_or_else(|| self.config.data_dir.join("openfang.db"))
+    }
+
+    fn record_heartbeat_execution(
+        &self,
+        agent_id: AgentId,
+        check_name: &str,
+        triggered_action: bool,
+    ) -> Result<Option<String>, String> {
+        let conn = Connection::open(self.heartbeat_log_db_path())
+            .map_err(|e| format!("open heartbeat DB failed: {e}"))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS heartbeat_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                check_name TEXT NOT NULL,
+                ran_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                triggered_action BOOLEAN DEFAULT 0,
+                user_feedback TEXT
+            )",
+        )
+        .map_err(|e| format!("create heartbeat_log failed: {e}"))?;
+        conn.execute(
+            "INSERT INTO heartbeat_log (agent_id, check_name, triggered_action)
+             VALUES (?1, ?2, ?3)",
+            params![
+                agent_id.to_string(),
+                check_name,
+                if triggered_action { 1_i64 } else { 0_i64 }
+            ],
+        )
+        .map_err(|e| format!("insert heartbeat_log failed: {e}"))?;
+
+        if triggered_action {
+            return Ok(None);
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT triggered_action
+                 FROM heartbeat_log
+                 WHERE agent_id = ?1 AND check_name = ?2
+                 ORDER BY id DESC",
+            )
+            .map_err(|e| format!("prepare heartbeat_log query failed: {e}"))?;
+        let mut rows = stmt
+            .query(params![agent_id.to_string(), check_name])
+            .map_err(|e| format!("query heartbeat_log failed: {e}"))?;
+        let mut consecutive_no_action = 0usize;
+
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("read heartbeat_log row failed: {e}"))?
+        {
+            let logged_trigger: i64 = row
+                .get(0)
+                .map_err(|e| format!("decode heartbeat_log row failed: {e}"))?;
+            if logged_trigger == 0 {
+                consecutive_no_action += 1;
+            } else {
+                break;
+            }
+        }
+
+        if consecutive_no_action >= HEARTBEAT_REVIEW_THRESHOLD
+            && consecutive_no_action % HEARTBEAT_REVIEW_THRESHOLD == 0
+        {
+            Ok(Some(format!(
+                "[HEARTBEAT REVIEW] Check '{check_name}' triggered no action in 20 cycles. Review your HEARTBEAT.md — should this check be removed or reduced in frequency? Update the file if so."
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Start the background loop / register triggers for a single agent.
     pub fn start_background_for_agent(
         self: &Arc<Self>,
@@ -4153,8 +4301,44 @@ impl OpenFangKernel {
             .start_agent(agent_id, name, schedule, move |aid, msg| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
+                    let check_name = background_heartbeat_check_name(&msg);
                     match k.send_message(aid, &msg).await {
-                        Ok(_) => {}
+                        Ok(result) => {
+                            if let Some(check_name) = check_name {
+                                let triggered_action = heartbeat_triggered_action(&result);
+                                match k.record_heartbeat_execution(
+                                    aid,
+                                    &check_name,
+                                    triggered_action,
+                                ) {
+                                    Ok(Some(review_message)) => {
+                                        let review_kernel = Arc::clone(&k);
+                                        let review_check = check_name.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) =
+                                                review_kernel.send_message(aid, &review_message).await
+                                            {
+                                                warn!(
+                                                    agent_id = %aid,
+                                                    check_name = %review_check,
+                                                    error = %e,
+                                                    "Heartbeat review prompt failed"
+                                                );
+                                            }
+                                        });
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            agent_id = %aid,
+                                            check_name = %check_name,
+                                            error = %e,
+                                            "Failed to record background heartbeat execution"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         Err(e) => {
                             // send_message already records the panic in supervisor,
                             // just log the background context here

@@ -52,6 +52,7 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
+use rusqlite::{params, Connection};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -67,6 +68,7 @@ const HEARTBEAT_SCRIPT: &str = "/root/openfang-tools/heartbeat.sh";
 const DISK_CLEANUP_SCRIPT: &str = "/root/openfang-tools/cleanup.sh";
 const DISK_STATUS_CMD: &str = "df -h /";
 const ADMIN_API_BASE_URL: &str = "http://100.114.38.21:4200";
+const ROUTING_LOG_DB_RELATIVE_PATH: &str = "data/openfang.db";
 
 #[derive(Debug, Default)]
 struct CleanupSummary {
@@ -131,6 +133,137 @@ async fn run_command_capture(mut command: Command) -> Result<String, String> {
     }
 }
 
+fn strip_model_header(text: &str) -> String {
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    if !trimmed.starts_with("[model:") {
+        return text.to_string();
+    }
+
+    let mut lines = trimmed.lines();
+    let first = lines.next().unwrap_or_default().trim();
+    if !first.ends_with(']') {
+        return text.to_string();
+    }
+
+    let remainder = lines.collect::<Vec<_>>().join("\n");
+    remainder.trim_start_matches('\n').to_string()
+}
+
+fn format_int_with_commas(value: i64) -> String {
+    let digits = value.abs().to_string();
+    let mut out = String::new();
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    let mut formatted: String = out.chars().rev().collect();
+    if value < 0 {
+        formatted.insert(0, '-');
+    }
+    formatted
+}
+
+fn short_model_name(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    for (needle, short) in [
+        ("claude-sonnet-4-6", "sonnet"),
+        ("claude-opus-4-6", "opus"),
+        ("gemini-2.5-flash", "flash"),
+        ("gemini-flash", "flash"),
+        ("gemini-3.1-pro-preview", "gemini-pro"),
+        ("gemini-pro", "gemini-pro"),
+        ("codex-5.4", "codex"),
+        ("codex", "codex"),
+        ("grok-4-fast", "grok"),
+        ("grok", "grok"),
+        ("qwen", "qwen"),
+        ("system-ops", "system-ops"),
+        ("free", "free"),
+    ] {
+        if lower.contains(needle) {
+            return short.to_string();
+        }
+    }
+
+    model.split('-').next().unwrap_or(model).to_string()
+}
+
+fn format_footer(model: &str, tokens: Option<i64>, call_time_ms: Option<i64>) -> String {
+    let short = short_model_name(model);
+    let tok_str = tokens
+        .filter(|value| *value > 0)
+        .map(format_int_with_commas)
+        .unwrap_or_else(|| "?".to_string());
+    let duration_str = call_time_ms
+        .filter(|value| *value > 0)
+        .map(|value| format!("{:.1}", value as f64 / 1000.0))
+        .unwrap_or_else(|| "?".to_string());
+    format!("▸ {short} · {tok_str}t · {duration_str}s")
+}
+
+fn read_latest_routing_footer(home_dir: &std::path::Path, channel: &str) -> Option<String> {
+    let db_path = home_dir.join(ROUTING_LOG_DB_RELATIVE_PATH);
+    let con = Connection::open(db_path).ok()?;
+    let mut stmt = con
+        .prepare(
+            "SELECT model_chosen, token_count, call_time_ms \
+             FROM routing_log \
+             WHERE channel = ?1 AND COALESCE(success, 1) = 1 \
+             ORDER BY ts DESC \
+             LIMIT 1",
+        )
+        .ok()?;
+
+    let mut rows = stmt.query(params![channel]).ok()?;
+    let row = rows.next().ok().flatten()?;
+    let model: String = row.get(0).ok()?;
+    let token_count: Option<i64> = row.get(1).ok();
+    let call_time_ms: Option<i64> = row.get(2).ok();
+    Some(format_footer(&model, token_count, call_time_ms))
+}
+
+fn append_manual_heartbeat_update(
+    workspace_dir: &std::path::Path,
+    agent_name: &str,
+    instruction: &str,
+) -> Result<String, String> {
+    let heartbeat_path = workspace_dir.join("HEARTBEAT.md");
+    let now = chrono::Utc::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let timestamp = now.format("%Y-%m-%d %H:%M UTC").to_string();
+    let entry = format!("### Manual update — {timestamp}\n- {instruction}\n");
+
+    let mut content = if heartbeat_path.exists() {
+        std::fs::read_to_string(&heartbeat_path)
+            .map_err(|e| format!("Failed to read HEARTBEAT.md: {e}"))?
+    } else {
+        format!(
+            "# HEARTBEAT — {agent_name}\n# Version: 1.0\n# Last updated: {today}\n\n## Manual Updates\n"
+        )
+    };
+
+    if !content.contains("## Manual Updates") {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str("\n## Manual Updates\n");
+    } else if !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    if !content.ends_with("\n\n") {
+        content.push('\n');
+    }
+    content.push_str(&entry);
+
+    std::fs::write(&heartbeat_path, content)
+        .map_err(|e| format!("Failed to write HEARTBEAT.md: {e}"))?;
+
+    Ok(entry.trim_end().to_string())
+}
+
 fn read_admin_api_token(home_dir: &std::path::Path, fallback: &str) -> String {
     let config_path = home_dir.join("config.toml");
     match std::fs::read_to_string(config_path) {
@@ -184,6 +317,35 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .await
             .map_err(|e| format!("{e}"))?;
         Ok(result.response)
+    }
+
+    async fn decorate_response_for_channel(
+        &self,
+        agent_id: AgentId,
+        channel_type: &str,
+        response: String,
+    ) -> String {
+        if channel_type != "discord" {
+            return response;
+        }
+
+        let cleaned = strip_model_header(&response);
+        let agent_name = match self.kernel.registry.get(agent_id) {
+            Some(entry) => entry.name.clone(),
+            None => return cleaned,
+        };
+
+        let footer = match read_latest_routing_footer(&self.kernel.config.home_dir, &agent_name) {
+            Some(footer) => footer,
+            None => return cleaned,
+        };
+
+        let trimmed = cleaned.trim_end();
+        if trimmed.is_empty() {
+            footer
+        } else {
+            format!("{trimmed}\n\n{footer}")
+        }
     }
 
     async fn send_message_with_phases(
@@ -1011,6 +1173,42 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             let _ = command.output().await;
         });
         "Shutting down...".to_string()
+    }
+
+    async fn heartbeat_update_text(&self, agent_name: &str, instruction: &str) -> String {
+        let workspace_dir = self
+            .kernel
+            .config
+            .home_dir
+            .join("workspaces")
+            .join(agent_name);
+        if !workspace_dir.exists() {
+            let mut available: Vec<String> = self
+                .kernel
+                .config
+                .home_dir
+                .join("workspaces")
+                .read_dir()
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| !name.starts_with("persist-") && !name.starts_with("test-"))
+                .collect();
+            available.sort();
+            return format!(
+                "Unknown agent: {agent_name}. Available: {}",
+                available.join(", ")
+            );
+        }
+
+        match append_manual_heartbeat_update(&workspace_dir, agent_name, instruction) {
+            Ok(entry) => format!(
+                "Done. Added to HEARTBEAT.md for {agent_name}.\n\n{entry}"
+            ),
+            Err(error) => format!("Heartbeat update failed for {agent_name}: {error}"),
+        }
     }
 
     async fn record_delivery(
